@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "365375238598",
+    "project_id": "sajjanmart-955b1",
+    "storage_bucket": "sajjanmart-955b1.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:365375238598:android:af66ae73bed5965c6b42c7",
+        "android_client_info": {
+          "package_name": "com.sajjanmart"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCCp_EIMZqCpJo7-gEv65CVGEAePYiqwjM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
