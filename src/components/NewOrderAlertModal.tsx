@@ -7,6 +7,7 @@ import {
   Animated,
   Dimensions,
   Pressable,
+  ScrollView,
 } from 'react-native';
 import { Colors } from '../theme/colors';
 import type { Order } from '../types';
@@ -119,6 +120,16 @@ interface NewOrderAlertModalProps {
  *
  * The ONLY place in the app where Accept / Reject actions exist.
  * Cannot be dismissed by tapping outside, swiping, or auto-timer.
+ *
+ * Shows complete order details:
+ *   - Order number
+ *   - Customer name
+ *   - Customer phone
+ *   - Address
+ *   - All items with quantity and price
+ *   - Total
+ *   - Payment method
+ *   - Payment status
  * ────────────────────────────────────────────────────────────────────── */
 
 export function NewOrderAlertModal({
@@ -171,8 +182,14 @@ export function NewOrderAlertModal({
     onReject(order.id);
   };
 
-  const previewItems = order.items.slice(0, 3);
-  const extraCount = order.items.length - 3;
+  const previewItems = order.items.slice(0, 5);
+  const extraCount = order.items.length - 5;
+
+  // Build payment display string
+  const paymentParts: string[] = [];
+  if (order.paymentMethod) paymentParts.push(order.paymentMethod);
+  if (order.paymentStatus) paymentParts.push(order.paymentStatus);
+  const paymentDisplay = paymentParts.join(' · ');
 
   return (
     <Modal
@@ -189,58 +206,80 @@ export function NewOrderAlertModal({
               transform: [{ scale: scaleAnim }],
             },
           ]}>
-          {/* ── Icon ── */}
-          <PulsingIcon />
+          <ScrollView
+            style={s.modalScroll}
+            contentContainerStyle={s.modalScrollContent}
+            showsVerticalScrollIndicator={false}
+            bounces={false}>
+            {/* ── Icon ── */}
+            <PulsingIcon />
 
-          {/* ── NEW ORDER ── */}
-          <AnimatedLabel />
-          <Text style={s.orderId}>Order #{order.orderNumber || order.id}</Text>
+            {/* ── NEW ORDER ── */}
+            <AnimatedLabel />
+            <Text style={s.orderId}>Order #{order.orderNumber || order.id}</Text>
 
-          {/* ── Divider ── */}
-          <View style={s.divider} />
+            {/* ── Divider ── */}
+            <View style={s.divider} />
 
-          {/* ── Customer ── */}
-          <Text style={s.customerName}>{order.customerName}</Text>
-          <Text style={s.meta}>
-            {order.items.length} Item{order.items.length !== 1 ? 's' : ''}
-          </Text>
-          <Text style={s.time}>Order received at {formatTime(order.createdAt)}</Text>
-
-          {/* ── Items ── */}
-          <View style={s.itemList}>
-            {previewItems.map(item => (
-              <View key={item.id} style={s.itemRow}>
-                <Text style={s.itemName} numberOfLines={1}>
-                  {item.name}
-                </Text>
-                <Text style={s.itemQty}>× {item.quantity}</Text>
-              </View>
-            ))}
-            {extraCount > 0 && (
-              <Text style={s.moreItems}>
-                + {extraCount} more item{extraCount !== 1 ? 's' : ''}
+            {/* ── Customer Info ── */}
+            <Text style={s.customerName}>{order.customerName}</Text>
+            {order.customerPhone ? (
+              <Text style={s.customerDetail}>📞 {order.customerPhone}</Text>
+            ) : null}
+            {order.deliveryAddress ? (
+              <Text style={s.customerDetail} numberOfLines={2}>
+                📍 {order.deliveryAddress}
               </Text>
-            )}
-          </View>
+            ) : null}
+            <Text style={s.time}>Received at {formatTime(order.createdAt)}</Text>
 
-          {/* ── Total ── */}
-          <Text style={s.total}>{formatCurrency(order.grandTotal)}</Text>
+            {/* ── Items ── */}
+            <View style={s.itemList}>
+              <Text style={s.itemListHeader}>
+                Items ({order.items.length})
+              </Text>
+              {previewItems.map(item => (
+                <View key={item.id} style={s.itemRow}>
+                  <Text style={s.itemName} numberOfLines={1}>
+                    {item.name}
+                  </Text>
+                  <Text style={s.itemQty}>× {item.quantity}</Text>
+                  <Text style={s.itemPrice}>
+                    {item.price > 0 ? formatCurrency(item.total || item.price * item.quantity) : ''}
+                  </Text>
+                </View>
+              ))}
+              {extraCount > 0 && (
+                <Text style={s.moreItems}>
+                  + {extraCount} more item{extraCount !== 1 ? 's' : ''}
+                </Text>
+              )}
+            </View>
 
-          {/* ── Actions ── */}
-          <View style={s.actions}>
-            <Pressable
-              style={s.rejectBtn}
-              onPress={handleReject}
-              android_ripple={{ color: Colors.dangerLight }}>
-              <Text style={s.rejectText}>Reject</Text>
-            </Pressable>
-            <Pressable
-              style={s.acceptBtn}
-              onPress={handleAccept}
-              android_ripple={{ color: Colors.primaryDark }}>
-              <Text style={s.acceptText}>Accept</Text>
-            </Pressable>
-          </View>
+            {/* ── Total ── */}
+            <Text style={s.total}>{formatCurrency(order.grandTotal)}</Text>
+
+            {/* ── Payment Info ── */}
+            {paymentDisplay ? (
+              <Text style={s.paymentInfo}>💳 {paymentDisplay}</Text>
+            ) : null}
+
+            {/* ── Actions ── */}
+            <View style={s.actions}>
+              <Pressable
+                style={s.rejectBtn}
+                onPress={handleReject}
+                android_ripple={{ color: Colors.dangerLight }}>
+                <Text style={s.rejectText}>Reject</Text>
+              </Pressable>
+              <Pressable
+                style={s.acceptBtn}
+                onPress={handleAccept}
+                android_ripple={{ color: Colors.primaryDark }}>
+                <Text style={s.acceptText}>Accept</Text>
+              </Pressable>
+            </View>
+          </ScrollView>
         </Animated.View>
       </Animated.View>
     </Modal>
@@ -251,7 +290,7 @@ export function NewOrderAlertModal({
  * Styles
  * ────────────────────────────────────────────────────────────────────── */
 
-const { width: SCREEN_WIDTH } = Dimensions.get('window');
+const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
 const s = StyleSheet.create({
   overlay: {
@@ -264,19 +303,26 @@ const s = StyleSheet.create({
   modal: {
     width: '100%',
     maxWidth: SCREEN_WIDTH * 0.9,
+    maxHeight: SCREEN_HEIGHT * 0.8,
     backgroundColor: Colors.white,
     borderRadius: 26,
     borderWidth: 1,
     borderColor: '#E5E7EB',
-    paddingTop: 28,
-    paddingBottom: 24,
-    paddingHorizontal: 24,
-    alignItems: 'center',
+    overflow: 'hidden',
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 6 },
     shadowOpacity: 0.1,
     shadowRadius: 16,
     elevation: 6,
+  },
+  modalScroll: {
+    flexGrow: 0,
+  },
+  modalScrollContent: {
+    paddingTop: 28,
+    paddingBottom: 24,
+    paddingHorizontal: 24,
+    alignItems: 'center',
   },
 
   /* Icon */
@@ -339,7 +385,12 @@ const s = StyleSheet.create({
     fontSize: 17,
     fontWeight: '700',
     color: Colors.gray900,
-    marginBottom: 3,
+    marginBottom: 4,
+  },
+  customerDetail: {
+    fontSize: 13,
+    color: Colors.gray600,
+    marginBottom: 2,
   },
   meta: {
     fontSize: 14,
@@ -360,6 +411,12 @@ const s = StyleSheet.create({
     padding: 14,
     marginBottom: 16,
   },
+  itemListHeader: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: Colors.gray500,
+    marginBottom: 8,
+  },
   itemRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -376,6 +433,14 @@ const s = StyleSheet.create({
     fontSize: 13,
     color: Colors.gray500,
     fontWeight: '500',
+    marginRight: 12,
+  },
+  itemPrice: {
+    fontSize: 13,
+    color: Colors.gray700,
+    fontWeight: '600',
+    minWidth: 60,
+    textAlign: 'right',
   },
   moreItems: {
     fontSize: 13,
@@ -388,7 +453,14 @@ const s = StyleSheet.create({
     fontSize: 28,
     fontWeight: '800',
     color: Colors.primary,
-    marginBottom: 22,
+    marginBottom: 6,
+  },
+
+  /* Payment */
+  paymentInfo: {
+    fontSize: 13,
+    color: Colors.gray500,
+    marginBottom: 18,
   },
 
   /* Actions */
@@ -396,6 +468,7 @@ const s = StyleSheet.create({
     flexDirection: 'row',
     gap: 12,
     width: '100%',
+    marginTop: 4,
   },
   rejectBtn: {
     flex: 1,

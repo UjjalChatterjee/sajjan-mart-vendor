@@ -6,6 +6,16 @@
  *
  * Architecture:
  *   FCM Push  →  notification.service  →  Order Event  →  Order Store  →  UI
+ *
+ * App State Handling:
+ *   FOREGROUND  →  onMessage() fires → JS shows modal + starts sound
+ *   BACKGROUND  →  CustomMessagingService starts native OrderAlertService directly
+ *   KILLED      →  CustomMessagingService starts native OrderAlertService directly
+ *                  (no JS dependency for background/killed NEW_ORDER)
+ *
+ * Notification Actions (ACCEPT/REJECT):
+ *   App alive  →  DeviceEventEmitter receives from NotificationHelperModule
+ *   App killed →  HeadlessJsTask runs the JS task, which calls the API directly
  */
 
 import { Platform, PermissionsAndroid, NativeModules, DeviceEventEmitter, AppRegistry } from 'react-native';
@@ -26,9 +36,15 @@ import type { RemoteMessage } from '@react-native-firebase/messaging';
 export interface OrderNotificationData {
   type: 'NEW_ORDER';
   orderId: string;
+  orderNumber?: string;
   customerName: string;
+  customerPhone?: string;
+  address?: string;
   itemCount: string;
   total: string;
+  paymentMethod?: string;
+  paymentStatus?: string;
+  items?: string; // JSON array string
 }
 
 /** Action payload emitted by the native layer. */
@@ -64,6 +80,18 @@ const NATIVE_MODULE = NativeModules.NotificationHelper as
         total: string;
       }) => void;
       dismissNotification: (orderId: string) => void;
+      startOrderAlert: (data: {
+        orderId: string;
+        orderNumber: string;
+        customerName: string;
+        customerPhone: string;
+        address: string;
+        total: string;
+        paymentMethod: string;
+        paymentStatus: string;
+        items: string;
+      }) => void;
+      stopOrderAlert: () => void;
     }
   | undefined;
 
@@ -102,14 +130,12 @@ export async function getFCMToken(): Promise<string | null> {
     const m = getMessaging();
     const token = await getToken(m);
     if (__DEV__) {
-      console.log(`[FCM] FCM Token: ${token}`);
-      console.tron?.log({ message: `[FCM] FCM Token: ${token}` });
+      console.log('[FCM] FCM Token obtained (not logged for security)');
     }
     return token;
   } catch (error) {
     if (__DEV__) {
       console.error('[FCM] Failed to get token:', error);
-      console.tron?.error({ message: '[FCM] Failed to get token', error: String(error) });
     }
     return null;
   }
@@ -123,20 +149,9 @@ export async function registerFCMToken(_token: string): Promise<void> {
  * Native Notification Channel
  * ────────────────────────────────────────────────────────────────────── */
 
-/**
- * Ensure the Android notification channel exists.
- * Called once during initialization so OrderAlertService
- * can reference it without error.
- */
 function ensureNotificationChannel(): void {
   if (Platform.OS !== 'android' || !NATIVE_MODULE) return;
   try {
-    // showOrderNotification with a dummy triggers ensureChannel() natively
-    // But we don't want to show a notification — so we call the module
-    // only if it exposes an explicit ensureChannel method.
-    // For now, the channel is created lazily by NotificationHelperModule
-    // when showOrderNotification() is called. OrderAlertService uses its
-    // own channel. So this is a no-op placeholder for future use.
     if (__DEV__) {
       console.log('[FCM] Notification channel check completed');
     }
@@ -152,13 +167,11 @@ function ensureNotificationChannel(): void {
 export async function initializeNotifications(): Promise<void> {
   if (__DEV__) {
     console.log('[FCM] Initialization started');
-    console.tron?.log({ message: '[FCM] Initializing Firebase Messaging' });
   }
 
   const permissionGranted = await requestNotificationPermission();
   if (__DEV__) {
     console.log(`[FCM] Permission status: ${permissionGranted ? 'granted' : 'denied'}`);
-    console.tron?.log({ message: `[FCM] Permission status: ${permissionGranted ? 'granted' : 'denied'}` });
   }
 
   const token = await getFCMToken();
@@ -166,7 +179,6 @@ export async function initializeNotifications(): Promise<void> {
     await registerFCMToken(token);
   }
 
-  // Ensure the notification channel exists (needed by OrderAlertService)
   ensureNotificationChannel();
 
   // Clean up previous token refresh listener to prevent duplicates
@@ -178,8 +190,7 @@ export async function initializeNotifications(): Promise<void> {
   const m = getMessaging();
   const tokenSub = onTokenRefresh(m, newToken => {
     if (__DEV__) {
-      console.log(`[FCM] Token refreshed: ${newToken}`);
-      console.tron?.log({ message: `[FCM] Token refreshed: ${newToken}` });
+      console.log('[FCM] Token refreshed');
     }
     registerFCMToken(newToken);
   });
@@ -191,12 +202,15 @@ export async function initializeNotifications(): Promise<void> {
 
   if (__DEV__) {
     console.log('[FCM] Initialization complete');
-    console.tron?.log({ message: '[FCM] Initialization complete' });
   }
 }
 
 /* ──────────────────────────────────────────────────────────────────────
  * Foreground Messages
+ *
+ * When the app is in the foreground, the CustomMessagingService does NOT
+ * start OrderAlertService (to avoid duplicate notifications). Instead,
+ * this handler fires and the JS modal takes over.
  * ────────────────────────────────────────────────────────────────────── */
 
 export function setIncomingOrderHandler(handler: IncomingOrderHandler): void {
@@ -216,7 +230,6 @@ function startForegroundListener(): void {
   unsubscribeForeground = onMessage(m, async (remoteMessage: RemoteMessage) => {
     if (__DEV__) {
       console.log('[FCM] Foreground message received');
-      console.tron?.log({ message: '[FCM] Foreground message received', data: remoteMessage.data });
     }
 
     try {
@@ -225,8 +238,7 @@ function startForegroundListener(): void {
 
       if (data.type === 'NEW_ORDER') {
         if (__DEV__) {
-          console.log(`[FCM] Message type: NEW_ORDER, Order ID: ${data.orderId}`);
-          console.tron?.log({ message: `[FCM] NEW_ORDER from foreground — opening modal for ${data.orderId}` });
+          console.log(`[FCM] NEW_ORDER received — orderId: ${data.orderId ?? 'unknown'}`);
         }
 
         // Foreground: ONLY trigger the in-app modal.
@@ -238,7 +250,6 @@ function startForegroundListener(): void {
       }
     } catch (error) {
       console.error('[FCM] Error handling foreground message:', error);
-      console.tron?.error({ message: '[FCM] Foreground handler error', error: String(error) });
     }
   });
 }
@@ -254,7 +265,6 @@ export function stopForegroundListener(): void {
  * Native Notification Display
  *
  * Shows an Android notification with ACCEPT / REJECT action buttons.
- * Used by the background handler and foreground listener.
  * ────────────────────────────────────────────────────────────────────── */
 
 export function showNativeOrderNotification(data: OrderNotificationData): void {
@@ -271,6 +281,34 @@ export function showNativeOrderNotification(data: OrderNotificationData): void {
 export function dismissNotification(orderId: string): void {
   if (Platform.OS !== 'android' || !NATIVE_MODULE) return;
   NATIVE_MODULE.dismissNotification(orderId);
+}
+
+/* ──────────────────────────────────────────────────────────────────────
+ * Native Order Alert Sound (for foreground JS start)
+ *
+ * Starts the foreground service from JS when the app is in foreground.
+ * In background/killed, CustomMessagingService starts it directly.
+ * ────────────────────────────────────────────────────────────────────── */
+
+export function startNativeOrderAlert(data: OrderNotificationData): void {
+  if (Platform.OS !== 'android' || !NATIVE_MODULE) return;
+
+  NATIVE_MODULE.startOrderAlert({
+    orderId: data.orderId,
+    orderNumber: data.orderNumber || data.orderId,
+    customerName: data.customerName,
+    customerPhone: data.customerPhone || '',
+    address: data.address || '',
+    total: data.total,
+    paymentMethod: data.paymentMethod || '',
+    paymentStatus: data.paymentStatus || '',
+    items: data.items || '[]',
+  });
+}
+
+export function stopNativeOrderAlert(): void {
+  if (Platform.OS !== 'android' || !NATIVE_MODULE) return;
+  NATIVE_MODULE.stopOrderAlert();
 }
 
 /* ──────────────────────────────────────────────────────────────────────
@@ -301,8 +339,7 @@ function startActionEventListener(): void {
     'NotificationAction',
     (payload: NotificationActionPayload) => {
     if (__DEV__) {
-      console.log('[FCM] Notification action received:', payload);
-      console.tron?.log({ message: `[ORDER] Action ${payload.action} for ${payload.orderId}` });
+      console.log(`[ORDER-ACTION] ${payload.action === 'ORDER_ACCEPT' ? 'ACCEPT' : 'REJECT'} for order ${payload.orderId}`);
     }
       processAction(payload.action, payload.orderId);
     },
@@ -322,10 +359,9 @@ export function processAction(
 
   // Duplicate protection
   if (processedActions.has(key)) {
-  if (__DEV__) {
-    console.log('[FCM] Duplicate action ignored:', key);
-    console.tron?.warn({ message: `[ORDER] Duplicate action ignored: ${key}` });
-  }
+    if (__DEV__) {
+      console.log(`[ORDER-ACTION] Duplicate action ignored: ${key}`);
+    }
     return;
   }
   processedActions.add(key);
@@ -353,8 +389,7 @@ function startNotificationOpenedListener(): void {
     m,
     (remoteMessage: RemoteMessage) => {
     if (__DEV__) {
-      console.log('[FCM] Notification opened (background):', remoteMessage);
-      console.tron?.log({ message: '[FCM] Notification opened from background' });
+      console.log('[FCM] Notification opened (background)');
     }
       const data = remoteMessage.data as Record<string, string> | undefined;
       if (data?.type === 'NEW_ORDER' && onIncomingOrder) {
@@ -371,8 +406,7 @@ export async function handleInitialNotification(): Promise<OrderNotificationData
 
     if (remoteMessage?.data) {
     if (__DEV__) {
-      console.log('[FCM] Notification opened (killed):', remoteMessage);
-      console.tron?.log({ message: '[FCM] Notification opened from killed state' });
+      console.log('[FCM] Notification opened (killed)');
     }
       return remoteMessage.data as unknown as OrderNotificationData;
     }
@@ -385,17 +419,39 @@ export async function handleInitialNotification(): Promise<OrderNotificationData
 
 /* ──────────────────────────────────────────────────────────────────────
  * Background Message Handler
+ *
+ * For NEW_ORDER: CustomMessagingService handles this natively by starting
+ * OrderAlertService directly. This handler is a no-op for NEW_ORDER to
+ * prevent duplicate service starts.
+ *
+ * For other message types: future handlers can be added here.
  * ────────────────────────────────────────────────────────────────────── */
 
 export function registerBackgroundHandler(): void {
   const m = getMessaging();
   setBackgroundMessageHandler(m, async (remoteMessage: RemoteMessage) => {
+    const data = remoteMessage.data as Record<string, string> | undefined;
     if (__DEV__) {
-      console.log('[FCM] Background message:', remoteMessage);
+      console.log('[FCM] Background message received, type:', data?.type ?? 'unknown');
     }
-    // Firebase shows a system notification automatically.
-    // Our background handler in the future will build a custom
-    // notification with ACCEPT / REJECT action buttons.
+
+    // NEW_ORDER is handled natively by CustomMessagingService.
+    // As a safety net, also start OrderAlertService from JS in case
+    // the native service missed it. OrderAlertService handles duplicates
+    // gracefully (same orderId → no duplicate sound).
+    if (data?.type === 'NEW_ORDER' && Platform.OS === 'android' && NATIVE_MODULE) {
+      NATIVE_MODULE.startOrderAlert({
+        orderId: data.orderId || '',
+        orderNumber: data.orderNumber || data.orderId || '',
+        customerName: data.customerName || '',
+        customerPhone: data.customerPhone || '',
+        address: data.address || '',
+        total: data.total || '',
+        paymentMethod: data.paymentMethod || '',
+        paymentStatus: data.paymentStatus || '',
+        items: data.items || '[]',
+      });
+    }
   });
 }
 
@@ -404,22 +460,53 @@ export function registerBackgroundHandler(): void {
  *
  * Registered at module scope in index.js.  When Android starts this
  * service, the JS runtime boots and runs the registered task.
+ *
+ * This handler directly calls the API — no dependency on React components,
+ * App.tsx, or LoginScreen.
  * ────────────────────────────────────────────────────────────────────── */
 
 export function registerHeadlessTask(): void {
   AppRegistry.registerHeadlessTask(HEADLESS_TASK_NAME, () => {
     return async (taskData: { data: { action: string; orderId: string } }) => {
-    if (__DEV__) {
-      console.log('[FCM] Headless task running:', taskData);
-      console.tron?.log({ message: `[FCM] Headless task: ${taskData?.data?.action} for ${taskData?.data?.orderId}` });
-    }
-      const { action, orderId } = taskData?.data ?? {};
-      if (action && orderId) {
-        processAction(
-          action as 'ORDER_ACCEPT' | 'ORDER_REJECT',
-          orderId,
-        );
+      if (__DEV__) {
+        console.log('[FCM] Headless task running');
       }
+
+      const { action, orderId } = taskData?.data ?? {};
+      if (!action || !orderId) {
+        if (__DEV__) {
+          console.log('[FCM] Headless task: missing action or orderId');
+        }
+        return;
+      }
+
+      if (__DEV__) {
+        console.log(`[ORDER-ACTION] Headless task: ${action === 'ORDER_ACCEPT' ? 'ACCEPT' : 'REJECT'} for order ${orderId}`);
+      }
+
+      try {
+        // Directly call the API service — no React component dependency
+        const { acceptOrder, rejectOrder } = require('../services/order.service');
+
+        if (action === 'ORDER_ACCEPT') {
+          await acceptOrder(orderId);
+          if (__DEV__) {
+            console.log('[ORDER-ACTION] API success');
+          }
+        } else if (action === 'ORDER_REJECT') {
+          await rejectOrder(orderId);
+          if (__DEV__) {
+            console.log('[ORDER-ACTION] API success');
+          }
+        }
+      } catch (error) {
+        if (__DEV__) {
+          console.error('[ORDER-ACTION] API call failed:', error);
+        }
+      }
+
+      // Dismiss notification
+      dismissNotification(orderId);
     };
   });
 }

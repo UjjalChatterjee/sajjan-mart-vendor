@@ -20,9 +20,7 @@ import { Platform } from 'react-native';
  * - Android Device  → http://10.0.2.2:5000  (change to your LAN IP for physical device)
  */
 const DEV_BASE_URL =
-  Platform.OS === 'android'
-    ? 'http://192.168.31.193:3000'
-    : 'http://localhost:5000';
+  Platform.OS === 'android' ? 'http://127.0.0.1:3000' : 'http://localhost:5000';
 
 export const Env = {
   /** REST API base — no trailing slash */

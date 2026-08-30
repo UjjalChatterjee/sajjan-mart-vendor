@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Allow ALL cleartext HTTP for debug builds.
+         base-config applies to every host (including IP addresses).
+         domain-config with <domain> only matches domain names, NOT IPs. -->
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

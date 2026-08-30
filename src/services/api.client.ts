@@ -228,12 +228,26 @@ async function fetchJson<T>(
   headers: Record<string, string>,
   body?: unknown,
 ): Promise<{ data: T; response: Response }> {
-  const response = await fetch(url, {
-    method,
-    credentials: 'include',
-    headers,
-    body: body != null ? JSON.stringify(body) : undefined,
-  });
+  console.log(`[API-DEBUG] ${method} ${url}`);
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method,
+      credentials: 'include',
+      headers,
+      body: body != null ? JSON.stringify(body) : undefined,
+    });
+  } catch (fetchErr: any) {
+    console.log('[API-DEBUG] fetch THREW — full error dump:');
+    console.log('[API-DEBUG] error:', fetchErr);
+    console.log('[API-DEBUG] error.message:', fetchErr?.message);
+    console.log('[API-DEBUG] error.name:', fetchErr?.name);
+    console.log('[API-DEBUG] error.cause:', fetchErr?.cause);
+    console.log('[API-DEBUG] error.stack:', fetchErr?.stack);
+    console.log('[API-DEBUG] JSON.stringify(error):', JSON.stringify(fetchErr, Object.getOwnPropertyNames(fetchErr), 2));
+    throw fetchErr;
+  }
+  console.log(`[API-DEBUG] response status=${response.status} ok=${response.ok}`);
 
   const json: ApiResponse<T> | ApiErrorResponse = await response.json();
 
@@ -349,17 +363,32 @@ export async function apiPostWithResponse<T>(
   body?: unknown,
 ): Promise<{ data: T; response: Response }> {
   const url = `${Env.API_BASE_URL}${path}`;
+  console.log(`[API-DEBUG] POST ${url}`);
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-    },
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  } catch (fetchErr: any) {
+    console.log('[API-DEBUG] fetch THREW — full error dump:');
+    console.log('[API-DEBUG] error:', fetchErr);
+    console.log('[API-DEBUG] error.message:', fetchErr?.message);
+    console.log('[API-DEBUG] error.name:', fetchErr?.name);
+    console.log('[API-DEBUG] error.cause:', fetchErr?.cause);
+    console.log('[API-DEBUG] error.stack:', fetchErr?.stack);
+    console.log('[API-DEBUG] JSON.stringify(error):', JSON.stringify(fetchErr, Object.getOwnPropertyNames(fetchErr), 2));
+    throw fetchErr;
+  }
 
+  console.log(`[API-DEBUG] response status=${response.status} ok=${response.ok}`);
   const rawText = await response.text();
+  console.log(`[API-DEBUG] body length=${rawText.length} preview=${rawText.substring(0, 200)}`);
 
   let json: T;
   try {

@@ -21,7 +21,7 @@ import { useNavigation } from '../context/NavigationContext';
 import { useOrderStore } from '../store/orderStore';
 import { useToast } from '../context/ToastContext';
 import { useOrders } from '../hooks/useOrders';
-import { simulateNewOrder, processOrderItem, markOrderDispatched, markOrderDelivered } from '../services/order.service';
+import { processOrderItem, markOrderDispatched, markOrderDelivered } from '../services/order.service';
 import {
   setIncomingOrderHandler,
   removeIncomingOrderHandler,
@@ -30,7 +30,7 @@ import {
   handleInitialNotification,
 } from '../services/notification.service';
 import { ErrorModal } from '../components/ErrorModal';
-import type { Order } from '../types';
+import type { Order, OrderItem } from '../types';
 
 /* ── Fixed tab system with status mapping ── */
 
@@ -51,6 +51,83 @@ const FIXED_TABS: TabDef[] = [
 
 function ordersInTab(orders: Order[], statuses: string[]): Order[] {
   return orders.filter(o => statuses.includes(o.status));
+}
+
+/**
+ * Parse items JSON string into OrderItem[].
+ * Used when order data arrives via FCM (only items JSON is available).
+ */
+function parseItemsJson(itemsJson?: string): OrderItem[] {
+  if (!itemsJson) return [];
+  try {
+    const items = JSON.parse(itemsJson);
+    if (!Array.isArray(items)) return [];
+    return items.map((item: any, index: number) => ({
+      id: item.id || String(index + 1),
+      name: item.name || `Item ${index + 1}`,
+      variantName: item.variantName,
+      quantity: Number(item.quantity) || 1,
+      price: Number(item.price) || 0,
+      unit: item.unit,
+      image: item.image,
+      total: Number(item.total) || (Number(item.price) || 0) * (Number(item.quantity) || 1),
+      ready: false,
+      cancelled: false,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Build an Order from FCM notification data.
+ * Handles whatever data the backend sends in the FCM payload.
+ */
+function buildOrderFromNotification(data: {
+  orderId: string;
+  orderNumber?: string;
+  customerName: string;
+  customerPhone?: string;
+  address?: string;
+  itemCount: string;
+  total: string;
+  paymentMethod?: string;
+  paymentStatus?: string;
+  items?: string;
+}): Order {
+  const items = parseItemsJson(data.items);
+
+  // If no items JSON, create placeholder items from itemCount
+  const placeholderItems = items.length > 0 ? items : Array.from(
+    { length: parseInt(data.itemCount, 10) || 0 },
+    (_, i) => ({
+      id: String(i + 1),
+      name: `Item ${i + 1}`,
+      quantity: 1,
+      price: 0,
+      total: 0,
+      ready: false,
+      cancelled: false,
+    }),
+  );
+
+  return {
+    id: data.orderId,
+    orderNumber: data.orderNumber,
+    customerName: data.customerName || 'Customer',
+    customerPhone: data.customerPhone || '',
+    deliveryAddress: data.address || '',
+    status: 'pending' as const,
+    items: placeholderItems,
+    subtotal: parseInt(data.total, 10) || 0,
+    discount: 0,
+    deliveryCharge: 0,
+    tax: 0,
+    grandTotal: parseInt(data.total, 10) || 0,
+    createdAt: new Date().toISOString(),
+    paymentMethod: data.paymentMethod,
+    paymentStatus: data.paymentStatus,
+  };
 }
 
 export function OrdersScreen() {
@@ -142,31 +219,8 @@ export function OrdersScreen() {
   // Register FCM foreground handler — opens modal on new order
   useEffect(() => {
     setIncomingOrderHandler(data => {
-      const incoming = {
-        id: data.orderId,
-        customerName: data.customerName,
-        customerPhone: '',
-        deliveryAddress: '',
-        status: 'pending' as const,
-        items: Array.from(
-          { length: parseInt(data.itemCount, 10) || 0 },
-          (_, i) => ({
-            id: String(i + 1),
-            name: `Item ${i + 1}`,
-            quantity: 1,
-            price: 0,
-            total: 0,
-            ready: false,
-            cancelled: false,
-          }),
-        ),
-        subtotal: parseInt(data.total, 10) || 0,
-        discount: 0,
-        deliveryCharge: 0,
-        tax: 0,
-        grandTotal: parseInt(data.total, 10) || 0,
-        createdAt: new Date().toISOString(),
-      };
+      console.log('[ORDER-ALERT] Incoming order via FCM foreground');
+      const incoming = buildOrderFromNotification(data);
       setPendingNewOrder(incoming);
       setNewOrderVisible(true);
     });
@@ -174,31 +228,8 @@ export function OrdersScreen() {
     // Process any pending notification from killed-state launch
     handleInitialNotification().then(data => {
       if (data) {
-        const incoming = {
-          id: data.orderId,
-          customerName: data.customerName,
-          customerPhone: '',
-          deliveryAddress: '',
-          status: 'pending' as const,
-          items: Array.from(
-            { length: parseInt(data.itemCount, 10) || 0 },
-            (_, i) => ({
-              id: String(i + 1),
-              name: `Item ${i + 1}`,
-              quantity: 1,
-              price: 0,
-              total: 0,
-              ready: false,
-              cancelled: false,
-            }),
-          ),
-          subtotal: parseInt(data.total, 10) || 0,
-          discount: 0,
-          deliveryCharge: 0,
-          tax: 0,
-          grandTotal: parseInt(data.total, 10) || 0,
-          createdAt: new Date().toISOString(),
-        };
+        console.log('[ORDER-ALERT] Pending order from killed-state launch');
+        const incoming = buildOrderFromNotification(data);
         setPendingNewOrder(incoming);
         setNewOrderVisible(true);
       }
@@ -212,33 +243,23 @@ export function OrdersScreen() {
     setNotificationActionHandler(async ({ action, orderId }) => {
       try {
         if (action === 'ORDER_ACCEPT') {
+          console.log('[ORDER-ACTION] ACCEPT from notification');
           await acceptOrder(orderId);
           queryClient.invalidateQueries({ queryKey: ['orders'] });
+          showSuccess('Order accepted');
         } else if (action === 'ORDER_REJECT') {
+          console.log('[ORDER-ACTION] REJECT from notification');
           await rejectOrder(orderId);
           queryClient.invalidateQueries({ queryKey: ['orders'] });
+          showSuccess('Order rejected');
         }
       } catch {
         // Notification actions are fire-and-forget; errors are non-critical
       }
     });
     return () => removeNotificationActionHandler();
-  }, [acceptOrder, rejectOrder, queryClient]);
+  }, [acceptOrder, rejectOrder, queryClient, showSuccess]);
 
-  // Simulate a new order arriving after 8 seconds
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => {
-    if (!isLoading && orders.length > 0) {
-      timerRef.current = setTimeout(() => {
-        const incoming = simulateNewOrder();
-        setPendingNewOrder(incoming);
-        setNewOrderVisible(true);
-      }, 8000);
-    }
-    return () => {
-      if (timerRef.current) clearTimeout(timerRef.current);
-    };
-  }, [isLoading, orders.length]);
 
   // Pull-to-refresh via TanStack Query
   const handleRefresh = useCallback(() => {
@@ -350,6 +371,7 @@ export function OrdersScreen() {
   const handleModalAccept = useCallback(
     async (orderId: string) => {
       try {
+        console.log('[ORDER-ACTION] ACCEPT via modal');
         await acceptOrder(orderId);
         queryClient.invalidateQueries({ queryKey: ['orders'] });
         showSuccess('Order accepted successfully');
@@ -370,6 +392,7 @@ export function OrdersScreen() {
     async (orderId: string) => {
       setRejectingId(orderId);
       try {
+        console.log('[ORDER-ACTION] REJECT via modal');
         await rejectOrder(orderId);
         queryClient.invalidateQueries({ queryKey: ['orders'] });
         showSuccess('Order rejected successfully');
@@ -467,8 +490,6 @@ export function OrdersScreen() {
         })}
       </ScrollView>
 
-      {/* Order List */}
-      {/* Order List */}
       {/* Order List */}
       {isLoading && !hasEverLoaded.current ? (
         <View>
@@ -748,10 +769,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 18,
     paddingTop: 12,
     alignItems: 'stretch',
-
-    // IMPORTANT:
-    // Do NOT use flexGrow: 1
-    // Do NOT use justifyContent: 'center'
   },
 
   emptyContainer: {

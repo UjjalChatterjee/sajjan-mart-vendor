@@ -10,23 +10,35 @@ import android.util.Log
  *
  * Behaviour:
  *   1. Stop the order alert sound service
- *   2. App alive  → emit event to JS, dismiss notification
- *   3. App killed → start NotificationActionService (HeadlessJsTaskService)
+ *   2. Log the action with safe tags
+ *   3. App alive  → emit event to JS, dismiss notification
+ *   4. App killed → start NotificationActionService (HeadlessJsTaskService)
+ *
+ * Security:
+ *   - Never logs FCM tokens or authentication tokens
+ *   - Only logs orderId and action type
  */
 class NotificationActionReceiver : BroadcastReceiver() {
 
     companion object {
-        private const val TAG = "OrderAction"
+        private const val TAG = "NotificationActionReceiver"
     }
 
     override fun onReceive(context: Context, intent: Intent) {
         val orderId = intent.getStringExtra(NotificationHelperModule.EXTRA_ORDER_ID) ?: return
         val action = intent.getStringExtra(NotificationHelperModule.EXTRA_ACTION) ?: return
 
-        Log.d(TAG, "Action received: $action for order $orderId")
+        val actionName = when (action) {
+            NotificationHelperModule.ACTION_ACCEPT -> "ACCEPT"
+            NotificationHelperModule.ACTION_REJECT -> "REJECT"
+            else -> action
+        }
+
+        Log.d(TAG, "[ORDER-ACTION] $actionName for order $orderId")
 
         // Always stop the alert sound first
         OrderAlertService.stop(context)
+        Log.d(TAG, "[ORDER-ALERT] sound stopped")
 
         when (action) {
             NotificationHelperModule.ACTION_ACCEPT,

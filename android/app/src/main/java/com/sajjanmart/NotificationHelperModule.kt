@@ -9,6 +9,7 @@ import android.content.Intent
 import android.media.AudioAttributes
 import android.media.RingtoneManager
 import android.os.Build
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
@@ -16,7 +17,6 @@ import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.bridge.ReadableMap
 import com.facebook.react.modules.core.DeviceEventManagerModule
-import android.util.Log
 
 /**
  * Native module exposed to JS as "NotificationHelper".
@@ -24,6 +24,7 @@ import android.util.Log
  * Responsibilities:
  *   - Build and display Android notifications with ACCEPT / REJECT action buttons
  *   - Dismiss a notification by its deterministic ID
+ *   - Start / stop the foreground order alert service (loops alert.mp3)
  *   - Emit action events back to JS when the app is alive
  */
 class NotificationHelperModule(reactContext: ReactApplicationContext) :
@@ -107,8 +108,6 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
             val rejectIntent = createActionIntent(ctx, ACTION_REJECT, orderId)
 
             // ── Tap intent — opens the app ──
-            // Use SINGLE_TOP (not CLEAR_TOP) to avoid destroying and recreating
-            // the Activity, which would kill the React Native bridge.
             val tapIntent = Intent(ctx, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
                 putExtra(EXTRA_ORDER_ID, orderId)
@@ -160,15 +159,33 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
 
     /**
      * Start the foreground order alert service (loops alert.mp3).
-     * Safe to call multiple times — no duplicate players.
+     * Supports full order data including items, phone, address, payment.
+     *
+     * JS call:
+     *   NotificationHelper.startOrderAlert({
+     *     orderId, orderNumber, customerName, customerPhone,
+     *     address, total, paymentMethod, paymentStatus, items
+     *   })
      */
     @ReactMethod
     fun startOrderAlert(data: ReadableMap) {
+        Log.d(TAG, "[ORDER-ALERT] startOrderAlert called from JS")
+
         val orderId = data.getString("orderId") ?: return
+        val orderNumber = data.getString("orderNumber") ?: orderId
         val customerName = data.getString("customerName") ?: ""
-        val itemCount = data.getString("itemCount") ?: ""
+        val customerPhone = data.getString("customerPhone") ?: ""
+        val address = data.getString("address") ?: ""
         val total = data.getString("total") ?: ""
-        OrderAlertService.start(reactApplicationContext, orderId, customerName, itemCount, total)
+        val paymentMethod = data.getString("paymentMethod") ?: ""
+        val paymentStatus = data.getString("paymentStatus") ?: ""
+        val itemsJson = data.getString("items") ?: "[]"
+
+        OrderAlertService.start(
+            reactApplicationContext,
+            orderId, orderNumber, customerName, customerPhone,
+            address, total, paymentMethod, paymentStatus, itemsJson,
+        )
     }
 
     /**
@@ -177,6 +194,7 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
      */
     @ReactMethod
     fun stopOrderAlert() {
+        Log.d(TAG, "[ORDER-ALERT] stopOrderAlert called from JS")
         OrderAlertService.stop(reactApplicationContext)
     }
 
@@ -187,6 +205,7 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
      * Emits a "NotificationAction" event to JS.
      */
     fun emitActionToJS(action: String, orderId: String) {
+        Log.d(TAG, "[ORDER-ACTION] Emitting to JS: $action for order $orderId")
         val params = com.facebook.react.bridge.Arguments.createMap().apply {
             putString("action", action)
             putString("orderId", orderId)

@@ -9,6 +9,7 @@ import {
   Dimensions,
   Animated,
   Easing,
+  TouchableOpacity,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Colors } from '../theme/colors';
@@ -17,7 +18,11 @@ import { GlassButton } from '../components/GlassButton';
 import { CustomInput } from '../components/CustomInput';
 import { useNavigation } from '../context/NavigationContext';
 import { useAuth } from '../context/AuthContext';
-import { login as authLogin, fetchCurrentUser, isApiError } from '../services/auth.service';
+import {
+  login as authLogin,
+  fetchCurrentUser,
+  isApiError,
+} from '../services/auth.service';
 import { initializeNotifications } from '../services/notification.service';
 import { useToast } from '../context/ToastContext';
 import { ErrorModal } from '../components/ErrorModal';
@@ -96,8 +101,8 @@ export function LoginScreen() {
   const { setAuthenticated } = useAuth();
 
   /* form state */
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
+  const [email, setEmail] = useState('sajjany47@gmail.com');
+  const [password, setPassword] = useState('s@JJAN888');
   const [loading, setLoading] = useState(false);
   const [fieldErrors, setFieldErrors] = useState<{
     email?: string;
@@ -168,17 +173,23 @@ export function LoginScreen() {
         setErrorModalMessage('Invalid email or password');
         setErrorModalVisible(true);
       } else if (isApiError(error, 400)) {
-        setErrorModalMessage(error.message || 'Email and password are required');
+        setErrorModalMessage(
+          error.message || 'Email and password are required',
+        );
         setErrorModalVisible(true);
       } else if (isApiError(error, 500)) {
         setErrorModalMessage('Login failed');
         setErrorModalVisible(true);
       } else if (isApiError(error)) {
-        setErrorModalMessage(error.message || 'Something went wrong. Please try again.');
+        setErrorModalMessage(
+          error.message || 'Something went wrong. Please try again.',
+        );
         setErrorModalVisible(true);
       } else {
         // Network or server error
-        setErrorModalMessage('Unable to connect to the server. Please check your internet connection and try again.');
+        setErrorModalMessage(
+          'Unable to connect to the server. Please check your internet connection and try again.',
+        );
         setErrorModalVisible(true);
       }
     } finally {
@@ -193,12 +204,14 @@ export function LoginScreen() {
       <KeyboardAvoidingView
         style={styles.flex}
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-        keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 20}>
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 20}
+      >
         <ScrollView
           contentContainerStyle={styles.scroll}
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
-          bounces={false}>
+          bounces={false}
+        >
           {/* ── Brand ── */}
           <View style={styles.brand}>
             <BrandMark />
@@ -214,7 +227,8 @@ export function LoginScreen() {
                 opacity: cardAnim,
                 transform: [{ translateY: cardTranslateY }],
               },
-            ]}>
+            ]}
+          >
             <View style={styles.card}>
               <View style={styles.cardContent}>
                 <Text style={styles.cardTitle}>Welcome back</Text>
@@ -274,13 +288,51 @@ export function LoginScreen() {
             </View>
           </Animated.View>
 
+          {/* ── TEMP TEST BUTTON ── */}
+          <TouchableOpacity
+            style={{ marginTop: 20, padding: 12, backgroundColor: '#333', borderRadius: 8 }}
+            onPress={async () => {
+              console.log('[NET-TEST] ===== RAW FETCH START =====');
+              console.log('[NET-TEST] URL: http://127.0.0.1:3000/api/health');
+              try {
+                const resp = await fetch('http://127.0.0.1:3000/api/health');
+                console.log('[NET-TEST] resp.status:', resp.status);
+                console.log('[NET-TEST] resp.ok:', resp.ok);
+                const txt = await resp.text();
+                console.log('[NET-TEST] body:', txt);
+              } catch (err: any) {
+                console.log('[NET-TEST] ===== FETCH THREW =====');
+                console.log('[NET-TEST] typeof err:', typeof err);
+                console.log('[NET-TEST] err:', err);
+                console.log('[NET-TEST] err?.name:', err?.name);
+                console.log('[NET-TEST] err?.message:', err?.message);
+                console.log('[NET-TEST] err?.cause:', err?.cause);
+                console.log('[NET-TEST] err?.stack:', err?.stack);
+                try {
+                  console.log('[NET-TEST] JSON.stringify(err):', JSON.stringify(err, Object.getOwnPropertyNames(err), 2));
+                } catch (jse) {
+                  console.log('[NET-TEST] JSON.stringify FAILED:', String(jse));
+                  console.log('[NET-TEST] err.toString():', String(err));
+                  console.log('[NET-TEST] err.constructor?.name:', err?.constructor?.name);
+                  for (const key of Object.getOwnPropertyNames(err)) {
+                    console.log(`[NET-TEST] err.${key}:`, (err as any)[key]);
+                  }
+                }
+              }
+              console.log('[NET-TEST] ===== RAW FETCH END =====');
+            }}
+          >
+            <Text style={{ color: '#fff', textAlign: 'center', fontWeight: '600' }}>
+              TEST RAW FETCH
+            </Text>
+          </TouchableOpacity>
+
           {/* ── Footer ── */}
           <Text style={styles.footer}>
             Sajjan Mart{'  '}•{'  '}Store Management
           </Text>
         </ScrollView>
       </KeyboardAvoidingView>
-
 
       <ErrorModal
         visible={errorModalVisible}

@@ -13,13 +13,20 @@ import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import org.json.JSONArray
 
 /**
  * Foreground Service that plays alert.mp3 in a continuous loop.
  *
- * The persistent notification shows REJECT / ACCEPT actions so the
- * store staff can act directly from the notification even when the
- * app is in the background or killed.
+ * The persistent notification shows full order details with
+ * REJECT / ACCEPT actions so the store staff can act directly
+ * from the notification even when the app is in the background or killed.
+ *
+ * This service is fully native — no React Native dependency.
+ * It is started by:
+ *   - CustomMessagingService (background/killed FCM)
+ *   - NotificationHelperModule (from JS foreground)
+ *   - Sound service (from TS via native module)
  */
 class OrderAlertService : Service() {
 
@@ -29,21 +36,52 @@ class OrderAlertService : Service() {
         private const val CHANNEL_NAME = "Sajjan Mart Alert"
         private const val NOTIFICATION_ID = 9999
         private const val ACTION_STOP = "com.sajjanmart.ALERT_STOP"
-        private const val EXTRA_ORDER_ID = "order_id"
-        private const val EXTRA_CUSTOMER_NAME = "customer_name"
-        private const val EXTRA_ITEM_COUNT = "item_count"
-        private const val EXTRA_TOTAL = "total"
 
-        fun start(context: Context, orderId: String, customerName: String = "", itemCount: String = "", total: String = "") {
+        // Intent extras
+        private const val EXTRA_ORDER_ID = "order_id"
+        private const val EXTRA_ORDER_NUMBER = "order_number"
+        private const val EXTRA_CUSTOMER_NAME = "customer_name"
+        private const val EXTRA_CUSTOMER_PHONE = "customer_phone"
+        private const val EXTRA_ADDRESS = "address"
+        private const val EXTRA_TOTAL = "total"
+        private const val EXTRA_PAYMENT_METHOD = "payment_method"
+        private const val EXTRA_PAYMENT_STATUS = "payment_status"
+        private const val EXTRA_ITEMS_JSON = "items_json"
+
+        /**
+         * Start the order alert service with full order details.
+         * Safe to call multiple times — no duplicate players.
+         */
+        fun start(
+            context: Context,
+            orderId: String,
+            orderNumber: String = orderId,
+            customerName: String = "",
+            customerPhone: String = "",
+            address: String = "",
+            total: String = "",
+            paymentMethod: String = "",
+            paymentStatus: String = "",
+            itemsJson: String = "[]",
+        ) {
             val intent = Intent(context, OrderAlertService::class.java).apply {
                 putExtra(EXTRA_ORDER_ID, orderId)
+                putExtra(EXTRA_ORDER_NUMBER, orderNumber)
                 putExtra(EXTRA_CUSTOMER_NAME, customerName)
-                putExtra(EXTRA_ITEM_COUNT, itemCount)
+                putExtra(EXTRA_CUSTOMER_PHONE, customerPhone)
+                putExtra(EXTRA_ADDRESS, address)
                 putExtra(EXTRA_TOTAL, total)
+                putExtra(EXTRA_PAYMENT_METHOD, paymentMethod)
+                putExtra(EXTRA_PAYMENT_STATUS, paymentStatus)
+                putExtra(EXTRA_ITEMS_JSON, itemsJson)
             }
             context.startForegroundService(intent)
         }
 
+        /**
+         * Stop the order alert service and release audio.
+         * Safe to call multiple times.
+         */
         fun stop(context: Context) {
             val intent = Intent(context, OrderAlertService::class.java)
             context.stopService(intent)
@@ -72,15 +110,25 @@ class OrderAlertService : Service() {
         }
 
         val orderId = intent?.getStringExtra(EXTRA_ORDER_ID) ?: "unknown"
+        val orderNumber = intent?.getStringExtra(EXTRA_ORDER_NUMBER) ?: orderId
         val customerName = intent?.getStringExtra(EXTRA_CUSTOMER_NAME) ?: ""
-        val itemCount = intent?.getStringExtra(EXTRA_ITEM_COUNT) ?: ""
+        val customerPhone = intent?.getStringExtra(EXTRA_CUSTOMER_PHONE) ?: ""
+        val address = intent?.getStringExtra(EXTRA_ADDRESS) ?: ""
         val total = intent?.getStringExtra(EXTRA_TOTAL) ?: ""
-        Log.d(TAG, "Starting alert for order: $orderId")
-        Log.d(TAG, "Alert audio resource: alert.mp3 (native OrderAlertService)")
+        val paymentMethod = intent?.getStringExtra(EXTRA_PAYMENT_METHOD) ?: ""
+        val paymentStatus = intent?.getStringExtra(EXTRA_PAYMENT_STATUS) ?: ""
+        val itemsJson = intent?.getStringExtra(EXTRA_ITEMS_JSON) ?: "[]"
+
+        Log.d(TAG, "[ORDER-ALERT] starting for order: $orderId")
 
         try {
             // Start as foreground service with persistent notification
-            startForeground(NOTIFICATION_ID, buildForegroundNotification(orderId, customerName, itemCount, total))
+            val notification = buildForegroundNotification(
+                orderId, orderNumber, customerName, customerPhone,
+                address, total, paymentMethod, paymentStatus, itemsJson,
+            )
+            startForeground(NOTIFICATION_ID, notification)
+            Log.d(TAG, "[ORDER-ALERT] notification created")
 
             // Start looping playback
             startPlayback()
@@ -111,11 +159,8 @@ class OrderAlertService : Service() {
             val resId = resources.getIdentifier("alert", "raw", packageName)
             if (resId == 0) {
                 Log.e(TAG, "alert.mp3 not found in res/raw")
-                Log.e(TAG, "Alert audio resource: MISSING (res/raw/alert.mp3)")
                 return
             }
-
-            Log.d(TAG, "Alert audio resource: alert.mp3 (res/raw/alert.mp3, id=$resId)")
 
             mediaPlayer = MediaPlayer().apply {
                 setAudioAttributes(
@@ -129,7 +174,7 @@ class OrderAlertService : Service() {
                 setOnPreparedListener {
                     start()
                     this@OrderAlertService.isPlaying = true
-                    Log.d(TAG, "Alert playback started (looping)")
+                    Log.d(TAG, "[ORDER-ALERT] sound started")
                 }
                 setOnErrorListener { _, what, extra ->
                     Log.e(TAG, "Alert playback error: what=$what extra=$extra")
@@ -145,11 +190,6 @@ class OrderAlertService : Service() {
     }
 
     private fun stopPlayback() {
-        if (!isPlaying && mediaPlayer == null) {
-            Log.d(TAG, "Alert playback stop requested — nothing active")
-            return
-        }
-
         try {
             mediaPlayer?.apply {
                 if (isPlaying) stop()
@@ -165,7 +205,7 @@ class OrderAlertService : Service() {
         }
     }
 
-    // ── Notification ──
+    // ── Notification Channel ──
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -180,18 +220,28 @@ class OrderAlertService : Service() {
                     enableVibration(true)
                     vibrationPattern = longArrayOf(0, 500, 0, 500)
                     setBypassDnd(true)
+                    lockscreenVisibility = Notification.VISIBILITY_PUBLIC
                 }
                 nm.createNotificationChannel(channel)
             }
         }
     }
 
+    // ── Build Notification ──
+
     private fun buildForegroundNotification(
         orderId: String,
+        orderNumber: String,
         customerName: String,
-        itemCount: String,
+        customerPhone: String,
+        address: String,
         total: String,
+        paymentMethod: String,
+        paymentStatus: String,
+        itemsJson: String,
     ): Notification {
+        val channelId = CHANNEL_ID
+
         // ── Action intents ──
         val rejectIntent = Intent(this, NotificationActionReceiver::class.java).apply {
             action = NotificationHelperModule.ACTION_REJECT
@@ -218,8 +268,6 @@ class OrderAlertService : Service() {
         )
 
         // ── Tap intent — open app ──
-        // Use SINGLE_TOP (not CLEAR_TOP) to avoid destroying and recreating
-        // the Activity, which would kill the React Native bridge.
         val tapIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
             putExtra(EXTRA_ORDER_ID, orderId)
@@ -229,24 +277,55 @@ class OrderAlertService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 
-        // ── Build content text ──
+        // ── Build compact items text ──
+        val itemsText = buildItemsText(itemsJson)
+
+        // ── Build full notification text ──
         val bigText = buildString {
-            append("Order #$orderId")
-            if (customerName.isNotEmpty() || itemCount.isNotEmpty()) {
-                append("\n")
-                if (customerName.isNotEmpty()) append(customerName)
-                if (customerName.isNotEmpty() && itemCount.isNotEmpty()) append(" • ")
-                if (itemCount.isNotEmpty()) append("$itemCount items")
+            append("Order #${orderNumber}")
+
+            // Customer info
+            if (customerName.isNotEmpty()) {
+                append("\n\nCustomer: $customerName")
             }
+            if (customerPhone.isNotEmpty()) {
+                append("\nPhone: $customerPhone")
+            }
+            if (address.isNotEmpty()) {
+                append("\nAddress: $address")
+            }
+
+            // Items list
+            if (itemsText.isNotEmpty()) {
+                append("\n\nItems:")
+                append(itemsText)
+            }
+
+            // Total
             if (total.isNotEmpty()) {
-                append("\n₹$total")
+                append("\n\nTotal: ₹$total")
+            }
+
+            // Payment
+            if (paymentMethod.isNotEmpty() || paymentStatus.isNotEmpty()) {
+                append("\nPayment: ")
+                if (paymentMethod.isNotEmpty()) append(paymentMethod)
+                if (paymentMethod.isNotEmpty() && paymentStatus.isNotEmpty()) append(" / ")
+                if (paymentStatus.isNotEmpty()) append(paymentStatus)
             }
         }
 
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        // ── Build content text (truncated for collapsed view) ──
+        val contentText = buildString {
+            append("Order #${orderNumber}")
+            if (customerName.isNotEmpty()) append(" • $customerName")
+            if (total.isNotEmpty()) append(" • ₹$total")
+        }
+
+        return NotificationCompat.Builder(this, channelId)
             .setSmallIcon(android.R.drawable.ic_popup_reminder)
-            .setContentTitle("Sajjan Mart — New Order")
-            .setContentText("Order #$orderId")
+            .setContentTitle("🛒 NEW ORDER")
+            .setContentText(contentText)
             .setStyle(NotificationCompat.BigTextStyle().bigText(bigText))
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_ALARM)
@@ -256,5 +335,38 @@ class OrderAlertService : Service() {
             .addAction(0, "REJECT", rejectPending)
             .addAction(0, "ACCEPT", acceptPending)
             .build()
+    }
+
+    /**
+     * Parse the items JSON array and build a compact text representation.
+     *
+     * Expected JSON format:
+     * [
+     *   { "name": "Product A", "quantity": 2, "price": 100 },
+     *   { "name": "Product B", "quantity": 1, "price": 150 }
+     * ]
+     */
+    private fun buildItemsText(itemsJson: String): String {
+        try {
+            val items = JSONArray(itemsJson)
+            if (items.length() == 0) return ""
+
+            return buildString {
+                for (i in 0 until items.length()) {
+                    val item = items.getJSONObject(i)
+                    val name = item.optString("name", "Item")
+                    val qty = item.optInt("quantity", 1)
+                    val price = item.optDouble("price", 0.0)
+
+                    append("\n  • $name × $qty")
+                    if (price > 0) {
+                        append(" — ₹${String.format("%.0f", price * qty)}")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to parse items JSON", e)
+            return ""
+        }
     }
 }

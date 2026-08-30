@@ -15,13 +15,18 @@ import com.facebook.react.jstasks.HeadlessJsTaskConfig
  * The service:
  *   1. Boots the JS runtime if not already running
  *   2. Runs the "NotificationActionTask" JS handler
- *   3. Dismisses the notification
- *   4. Stops itself
+ *   3. The JS handler calls the API directly (no component dependency)
+ *   4. Dismisses the notification
+ *   5. Stops itself
+ *
+ * Security:
+ *   - Never logs FCM tokens or authentication tokens
+ *   - Only logs orderId and action type
  */
 class NotificationActionService : HeadlessJsTaskService() {
 
     companion object {
-        private const val TAG = "OrderActionService"
+        private const val TAG = "NotificationActionService"
         private const val JS_TASK_NAME = "NotificationActionTask"
         private const val TASK_TIMEOUT_MS: Long = 10_000 // 10 seconds
     }
@@ -30,7 +35,12 @@ class NotificationActionService : HeadlessJsTaskService() {
         val orderId = intent?.getStringExtra(NotificationHelperModule.EXTRA_ORDER_ID) ?: return null
         val action = intent.getStringExtra(NotificationHelperModule.EXTRA_ACTION) ?: return null
 
-        Log.d(TAG, "Starting task: $action for order $orderId")
+        val actionName = when (action) {
+            NotificationHelperModule.ACTION_ACCEPT -> "ACCEPT"
+            NotificationHelperModule.ACTION_REJECT -> "REJECT"
+            else -> action
+        }
+        Log.d(TAG, "[ORDER-ACTION] Starting headless task: $actionName for order $orderId")
 
         val data = Arguments.createMap().apply {
             putString("action", action)
