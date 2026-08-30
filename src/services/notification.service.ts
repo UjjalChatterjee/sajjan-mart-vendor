@@ -29,6 +29,7 @@ import {
   setBackgroundMessageHandler,
 } from '@react-native-firebase/messaging';
 import type { RemoteMessage } from '@react-native-firebase/messaging';
+import { apiPost } from './api.client';
 
 /* ── Types ── */
 
@@ -141,8 +142,36 @@ export async function getFCMToken(): Promise<string | null> {
   }
 }
 
-export async function registerFCMToken(_token: string): Promise<void> {
-  // TODO: POST token to backend /api/devices
+export async function registerFCMToken(token: string): Promise<void> {
+  if (!token || token.length === 0) {
+    if (__DEV__) {
+      console.log('[FCM] token received: no — skipping registration');
+    }
+    return;
+  }
+
+  if (__DEV__) {
+    console.log('[FCM] token received: yes');
+    console.log('[FCM] token length:', token.length);
+    console.log('[FCM] registering device');
+  }
+
+  try {
+    const result = await apiPost<unknown>('/api/notifications/register-device', {
+      fcmToken: token,
+      platform: 'android',
+    });
+    if (__DEV__) {
+      console.log('[FCM] register-device response: success');
+      console.log('[FCM] device registration successful');
+    }
+  } catch (error: unknown) {
+    if (__DEV__) {
+      const status = error instanceof Error ? error.message : String(error);
+      console.log('[FCM] register-device response:', status);
+      console.log('[FCM] device registration failed — will retry on token refresh');
+    }
+  }
 }
 
 /* ──────────────────────────────────────────────────────────────────────
