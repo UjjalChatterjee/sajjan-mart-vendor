@@ -21,7 +21,7 @@ import { useNavigation } from '../context/NavigationContext';
 import { useOrderStore } from '../store/orderStore';
 import { useToast } from '../context/ToastContext';
 import { useOrders } from '../hooks/useOrders';
-import { processOrderItem, markOrderDispatched, markOrderDelivered } from '../services/order.service';
+import { processOrderItem, markOrderDispatched, markOrderDelivered, cancelApproveItems, cancelRejectItems } from '../services/order.service';
 import {
   setIncomingOrderHandler,
   removeIncomingOrderHandler,
@@ -30,6 +30,7 @@ import {
   handleInitialNotification,
 } from '../services/notification.service';
 import { ErrorModal } from '../components/ErrorModal';
+import { CancelRequestOrderCard } from '../components/CancelRequestOrderCard';
 import type { Order, OrderItem } from '../types';
 
 /* ── Fixed tab system with status mapping ── */
@@ -521,53 +522,78 @@ export function OrdersScreen() {
           showsVerticalScrollIndicator={false}
           refreshing={isFetching && !isLoading}
           onRefresh={handleRefresh}
-          renderItem={({ item }) => (
-            <OrderCard
-              order={item}
-              isAccepting={acceptingId === item.id}
-              onAccept={async orderId => {
-                setAcceptingId(orderId);
-                try {
-                  await acceptOrder(orderId);
-                  queryClient.invalidateQueries({ queryKey: ['orders'] });
-                  showSuccess('Order accepted successfully');
-                } catch (err) {
-                  setErrorModalMessage(
-                    err instanceof Error ? err.message : 'Failed to accept order',
-                  );
-                  setErrorModalVisible(true);
-                } finally {
-                  setAcceptingId(null);
-                }
-              }}
-              isRejecting={rejectingId === item.id}
-              onReject={async orderId => {
-                setRejectingId(orderId);
+          renderItem={({ item }) => {
+            if (item.status === 'cancel_request') {
+              return (
+                <CancelRequestOrderCard
+                  order={item}
+                  onApproveItem={async () => {
+                    await cancelApproveItems(item.id, []);
+                  }}
+                  onRejectItem={async () => {
+                    await cancelRejectItems(item.id, []);
+                  }}
+                  onApproveSelected={async (_orderId, itemIds) => {
+                    await cancelApproveItems(item.id, itemIds);
+                  }}
+                  onRejectSelected={async (_orderId, itemIds) => {
+                    await cancelRejectItems(item.id, itemIds);
+                  }}
+                  queryClient={queryClient}
+                  showSuccess={showSuccess}
+                  showError={showError}
+                />
+              );
+            }
 
-                try {
-                  await rejectOrder(orderId);
-                  queryClient.invalidateQueries({ queryKey: ['orders'] });
-                  showSuccess('Order rejected successfully');
-                } catch (err) {
-                  setErrorModalMessage(
-                    err instanceof Error
-                      ? err.message
-                      : 'Failed to reject order',
-                  );
-                  setErrorModalVisible(true);
-                } finally {
-                  setRejectingId(null);
-                }
-              }}
-              onMarkDispatched={handleMarkDispatched}
-              isDispatching={dispatchingId === item.id}
-              onItemReady={handleItemReady}
-              onItemCancel={handleItemCancel}
-              processingItems={processingItems}
-              onMarkDelivered={handleMarkDelivered}
-              isDelivering={deliveringId === item.id}
-            />
-          )}
+            return (
+              <OrderCard
+                order={item}
+                isAccepting={acceptingId === item.id}
+                onAccept={async orderId => {
+                  setAcceptingId(orderId);
+                  try {
+                    await acceptOrder(orderId);
+                    queryClient.invalidateQueries({ queryKey: ['orders'] });
+                    showSuccess('Order accepted successfully');
+                  } catch (err) {
+                    setErrorModalMessage(
+                      err instanceof Error ? err.message : 'Failed to accept order',
+                    );
+                    setErrorModalVisible(true);
+                  } finally {
+                    setAcceptingId(null);
+                  }
+                }}
+                isRejecting={rejectingId === item.id}
+                onReject={async orderId => {
+                  setRejectingId(orderId);
+
+                  try {
+                    await rejectOrder(orderId);
+                    queryClient.invalidateQueries({ queryKey: ['orders'] });
+                    showSuccess('Order rejected successfully');
+                  } catch (err) {
+                    setErrorModalMessage(
+                      err instanceof Error
+                        ? err.message
+                        : 'Failed to reject order',
+                    );
+                    setErrorModalVisible(true);
+                  } finally {
+                    setRejectingId(null);
+                  }
+                }}
+                onMarkDispatched={handleMarkDispatched}
+                isDispatching={dispatchingId === item.id}
+                onItemReady={handleItemReady}
+                onItemCancel={handleItemCancel}
+                processingItems={processingItems}
+                onMarkDelivered={handleMarkDelivered}
+                isDelivering={deliveringId === item.id}
+              />
+            );
+          }}
         />
       )}
 

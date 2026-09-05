@@ -69,6 +69,8 @@ export interface Order {
   notes?: string;
   paymentMethod?: string;
   paymentStatus?: string;
+  /** Item ids for which cancellation was explicitly requested (status = cancel_request). */
+  cancel_request_items?: string[];
 }
 
 export type Screen = 'login' | 'register' | 'orders' | 'notifications' | 'settings';
@@ -123,4 +125,6 @@ export interface BackendOrder {
   user?: BackendOrderUser;
   order_items: BackendOrderItem[];
   amounts?: Record<string, unknown>;
+  /** Item ids for which cancellation was explicitly requested. */
+  cancel_request_items?: string[];
 }

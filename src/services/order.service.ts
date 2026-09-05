@@ -8,6 +8,18 @@
 import { apiGet, apiPost, apiPut } from './api.client';
 import type { Order, OrderAddress, OrderAmounts, BackendOrder, OrderItem, BackendOrderItem } from '../types';
 
+/** Cancel approve / reject response shape from the backend. */
+export interface CancelActionResponse {
+  success: boolean;
+  message?: string;
+  data?: {
+    cancel_request_items?: string[];
+    refundDueTotal?: number;
+    updatedTotal?: number;
+    [key: string]: unknown;
+  };
+}
+
 /* ── Field mapping: Backend → UI ─────────────────────────────────────── */
 
 function mapBackendItem(item: BackendOrderItem): OrderItem {
@@ -100,6 +112,9 @@ function mapBackendOrder(raw: BackendOrder): Order {
     notes: raw.notes ?? undefined,
     paymentMethod: raw.payment_method,
     paymentStatus: raw.payment_status,
+    cancel_request_items: Array.isArray(raw.cancel_request_items)
+      ? raw.cancel_request_items.map(String)
+      : undefined,
   };
 }
 
@@ -183,6 +198,38 @@ export async function markOrderDelivered(orderId: string): Promise<void> {
   await apiPut(`/api/orders/${encodeURIComponent(orderId)}`, {
     status: 'delivered',
   });
+}
+
+/**
+ * Approve selected items for cancellation refund.
+ *
+ * POST /api/orders/{orderId}/cancel/approve
+ * Body: { "item_ids": ["<itemId>", ...] }
+ */
+export async function cancelApproveItems(
+  orderId: string,
+  itemIds: string[],
+): Promise<CancelActionResponse> {
+  return apiPost<CancelActionResponse>(
+    `/api/orders/${encodeURIComponent(orderId)}/cancel/approve`,
+    { item_ids: itemIds.map(id => String(id)) },
+  );
+}
+
+/**
+ * Reject selected items' cancellation request (no refund for those items).
+ *
+ * POST /api/orders/{orderId}/cancel/reject
+ * Body: { "item_ids": ["<itemId>", ...] }
+ */
+export async function cancelRejectItems(
+  orderId: string,
+  itemIds: string[],
+): Promise<CancelActionResponse> {
+  return apiPost<CancelActionResponse>(
+    `/api/orders/${encodeURIComponent(orderId)}/cancel/reject`,
+    { item_ids: itemIds.map(id => String(id)) },
+  );
 }
 
 /**

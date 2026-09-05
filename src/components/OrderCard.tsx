@@ -613,6 +613,24 @@ export function OrderCard({
         </View>
       )}
 
+      {/* Payment status for cancelled orders */}
+      {order.status === 'cancelled' && order.paymentStatus != null && (
+        <View style={styles.paymentRow}>
+          <Text style={styles.paymentStatus}>
+            Payment Status: {(order.paymentStatus || '—').charAt(0).toUpperCase() + (order.paymentStatus || '—').slice(1)}
+          </Text>
+        </View>
+      )}
+
+      {/* Payment info fallback for cancelled orders when payment method missing */}
+      {order.status === 'cancelled' && order.paymentStatus != null && !order.paymentMethod && (
+        <View style={styles.paymentRow}>
+          <Text style={[styles.paymentMethod, styles.paymentStatus]}>
+            Payment Status: {(order.paymentStatus || '—').charAt(0).toUpperCase() + (order.paymentStatus || '—').slice(1)}
+          </Text>
+        </View>
+      )}
+
       {/* Order items */}
       {hasMore ? (
         <View style={styles.itemsSection}>
@@ -811,6 +829,12 @@ const styles = StyleSheet.create({
     marginBottom: 10,
   },
   paymentMethod: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: Colors.gray500,
+    letterSpacing: 0.5,
+  },
+  paymentStatus: {
     fontSize: 11,
     fontWeight: '700',
     color: Colors.gray500,

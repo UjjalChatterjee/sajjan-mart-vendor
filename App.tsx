@@ -4,8 +4,8 @@
  * @format
  */
 
-import React, { useEffect, useRef } from 'react';
-import { StatusBar, View, StyleSheet, ActivityIndicator } from 'react-native';
+import React, { useEffect, useRef, useState } from 'react';
+import { StatusBar, View, StyleSheet } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { queryClient } from './src/services/queryClient';
@@ -18,17 +18,7 @@ import { OrdersScreen } from './src/screens/OrdersScreen';
 import { NotificationSettingsScreen } from './src/screens/NotificationSettingsScreen';
 import { SettingsScreen } from './src/screens/SettingsScreen';
 import { Colors } from './src/theme/colors';
-
-/**
- * Loading screen shown while checking for stored auth tokens on startup.
- */
-function AuthLoadingScreen() {
-  return (
-    <View style={styles.loadingRoot}>
-      <ActivityIndicator size="large" color={Colors.primary} />
-    </View>
-  );
-}
+import { SplashScreen } from './src/components/SplashScreen';
 
 /**
  * Screen router — decides between auth screens and the main app.
@@ -37,8 +27,9 @@ function AppContent() {
   const { isInitialized, isAuthenticated } = useAuth();
   const { state, resetHistoryToLogin } = useNavigation();
   const wasAuthenticated = useRef(isAuthenticated);
+  const [showSplash, setShowSplash] = useState(true);
 
-  console.log('[APP] AppContent render: isInitialized=', isInitialized, '| isAuthenticated=', isAuthenticated, '| nav screen=', state.screen);
+  console.log('[APP] AppContent render: isInitialized=', isInitialized, '| isAuthenticated=', isAuthenticated, '| nav screen=', state.screen, '| showSplash=', showSplash);
 
   /* When auth drops to false (logout / token expiry), always reset nav to login */
   useEffect(() => {
@@ -50,9 +41,15 @@ function AppContent() {
     wasAuthenticated.current = isAuthenticated;
   }, [isAuthenticated, resetHistoryToLogin]);
 
-  /* Still checking stored tokens on mount */
-  if (!isInitialized) {
-    return <AuthLoadingScreen />;
+  /* Handle splash animation completion */
+  const handleSplashComplete = () => {
+    console.log('[APP] Splash animation complete');
+    setShowSplash(false);
+  };
+
+  /* Show splash while initializing or during splash animation */
+  if (!isInitialized || showSplash) {
+    return <SplashScreen onAnimationComplete={handleSplashComplete} />;
   }
 
   /* Not authenticated — always show Login, no matter what screen the nav thinks we're on */
@@ -102,12 +99,6 @@ function App() {
 const styles = StyleSheet.create({
   root: {
     flex: 1,
-  },
-  loadingRoot: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: Colors.screenBg,
   },
 });
 
