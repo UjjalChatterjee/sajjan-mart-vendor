@@ -5,6 +5,13 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Required for setBypassDnd() to take effect. Without this permission,
+         the channel's DND-bypass request is silently ignored by the OS.
+         The user must still grant access in system settings. -->
+    <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
+    <!-- Required for fullScreenIntent (heads-up on locked screen) on Android 14+ -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
 
     <application
       android:name=".MainApplication"
@@ -29,23 +36,25 @@
         </intent-filter>
       </activity>
 
-      <!-- Remove the library's default FirebaseMessagingService.
-           Our CustomMessagingService handles NEW_ORDER natively and
-           delegates token refresh to JS via ReactNativeFirebaseEventEmitter. -->
-      <service
-        android:name="io.invertase.firebase.messaging.ReactNativeFirebaseMessagingService"
+      <!-- The library's ReactNativeFirebaseMessagingService handles onNewToken
+           and other Firebase messaging callbacks. Do NOT remove it. -->
+
+      <!-- Replace the library's ReactNativeFirebaseMessagingReceiver with our
+           CustomMessagingReceiver. It intercepts NEW_ORDER messages and starts
+           OrderAlertService natively for background/killed states, then delegates
+           to super for normal JS dispatch (foreground modal, background handler). -->
+      <receiver
+        android:name="io.invertase.firebase.messaging.ReactNativeFirebaseMessagingReceiver"
         tools:node="remove" />
 
-      <!-- Custom FCM Service — handles NEW_ORDER natively (background/killed)
-           without JS dependency. For foreground, the
-           ReactNativeFirebaseMessagingReceiver still emits to JS. -->
-      <service
-        android:name=".CustomMessagingService"
-        android:exported="false">
+      <receiver
+        android:name=".CustomMessagingReceiver"
+        android:exported="true"
+        android:permission="com.google.android.c2dm.permission.SEND">
         <intent-filter>
-            <action android:name="com.google.firebase.MESSAGING_EVENT"/>
+            <action android:name="com.google.android.c2dm.intent.RECEIVE" />
         </intent-filter>
-      </service>
+      </receiver>
 
       <!-- Notification action receiver -->
       <receiver
@@ -60,6 +69,12 @@
       <!-- Headless JS service for killed-app notification actions -->
       <service
         android:name=".NotificationActionService"
+        android:exported="false" />
+
+      <!-- Native API service for killed-app ACCEPT/REJECT actions.
+           Calls the order API directly without React Native JS runtime. -->
+      <service
+        android:name=".NativeOrderApiService"
         android:exported="false" />
 
       <!-- Foreground service for continuous order alert playback -->

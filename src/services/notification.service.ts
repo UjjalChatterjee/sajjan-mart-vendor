@@ -9,8 +9,8 @@
  *
  * App State Handling:
  *   FOREGROUND  →  onMessage() fires → JS shows modal + starts sound
- *   BACKGROUND  →  CustomMessagingService starts native OrderAlertService directly
- *   KILLED      →  CustomMessagingService starts native OrderAlertService directly
+ *   BACKGROUND  →  CustomMessagingReceiver starts native OrderAlertService directly
+ *   KILLED      →  CustomMessagingReceiver starts native OrderAlertService directly
  *                  (no JS dependency for background/killed NEW_ORDER)
  *
  * Notification Actions (ACCEPT/REJECT):
@@ -81,6 +81,8 @@ const NATIVE_MODULE = NativeModules.NotificationHelper as
         total: string;
       }) => void;
       dismissNotification: (orderId: string) => void;
+      startForegroundSound: () => void;
+      stopForegroundSound: () => void;
       startOrderAlert: (data: {
         orderId: string;
         orderNumber: string;
@@ -237,7 +239,7 @@ export async function initializeNotifications(): Promise<void> {
 /* ──────────────────────────────────────────────────────────────────────
  * Foreground Messages
  *
- * When the app is in the foreground, the CustomMessagingService does NOT
+ * When the app is in the foreground, the CustomMessagingReceiver does NOT
  * start OrderAlertService (to avoid duplicate notifications). Instead,
  * this handler fires and the JS modal takes over.
  * ────────────────────────────────────────────────────────────────────── */
@@ -316,7 +318,7 @@ export function dismissNotification(orderId: string): void {
  * Native Order Alert Sound (for foreground JS start)
  *
  * Starts the foreground service from JS when the app is in foreground.
- * In background/killed, CustomMessagingService starts it directly.
+ * In background/killed, CustomMessagingReceiver starts it directly.
  * ────────────────────────────────────────────────────────────────────── */
 
 export function startNativeOrderAlert(data: OrderNotificationData): void {
@@ -449,7 +451,7 @@ export async function handleInitialNotification(): Promise<OrderNotificationData
 /* ──────────────────────────────────────────────────────────────────────
  * Background Message Handler
  *
- * For NEW_ORDER: CustomMessagingService handles this natively by starting
+ * For NEW_ORDER: CustomMessagingReceiver handles this natively by starting
  * OrderAlertService directly. This handler is a no-op for NEW_ORDER to
  * prevent duplicate service starts.
  *
@@ -464,7 +466,7 @@ export function registerBackgroundHandler(): void {
       console.log('[FCM] Background message received, type:', data?.type ?? 'unknown');
     }
 
-    // NEW_ORDER is handled natively by CustomMessagingService.
+    // NEW_ORDER is handled natively by CustomMessagingReceiver.
     // As a safety net, also start OrderAlertService from JS in case
     // the native service missed it. OrderAlertService handles duplicates
     // gracefully (same orderId → no duplicate sound).
@@ -497,45 +499,45 @@ export function registerBackgroundHandler(): void {
 export function registerHeadlessTask(): void {
   AppRegistry.registerHeadlessTask(HEADLESS_TASK_NAME, () => {
     return async (taskData: { data: { action: string; orderId: string } }) => {
-      if (__DEV__) {
-        console.log('[FCM] Headless task running');
-      }
+      console.log('[FCM] Headless task running');
 
       const { action, orderId } = taskData?.data ?? {};
       if (!action || !orderId) {
-        if (__DEV__) {
-          console.log('[FCM] Headless task: missing action or orderId');
-        }
+        console.log('[FCM] Headless task: missing action or orderId');
         return;
       }
 
-      if (__DEV__) {
-        console.log(`[ORDER-ACTION] Headless task: ${action === 'ORDER_ACCEPT' ? 'ACCEPT' : 'REJECT'} for order ${orderId}`);
-      }
+      const actionName = action === 'ORDER_ACCEPT' ? 'ACCEPT' : 'REJECT';
+      console.log(`[ORDER-ACTION] Headless task: ${actionName} for order ${orderId}`);
 
       try {
-        // Directly call the API service — no React component dependency
+        // Import the order service directly — no React component dependency.
+        // The API client reads the access token from AsyncStorage, which
+        // is available in the headless JS context.
         const { acceptOrder, rejectOrder } = require('../services/order.service');
 
         if (action === 'ORDER_ACCEPT') {
+          console.log(`[ORDER-ACTION] Calling acceptOrder(${orderId})`);
           await acceptOrder(orderId);
-          if (__DEV__) {
-            console.log('[ORDER-ACTION] API success');
-          }
+          console.log('[ORDER-ACTION] API success — order accepted');
         } else if (action === 'ORDER_REJECT') {
+          console.log(`[ORDER-ACTION] Calling rejectOrder(${orderId})`);
           await rejectOrder(orderId);
-          if (__DEV__) {
-            console.log('[ORDER-ACTION] API success');
-          }
+          console.log('[ORDER-ACTION] API success — order rejected');
         }
-      } catch (error) {
-        if (__DEV__) {
-          console.error('[ORDER-ACTION] API call failed:', error);
-        }
-      }
 
-      // Dismiss notification
-      dismissNotification(orderId);
+        // SUCCESS: dismiss the notification
+        dismissNotification(orderId);
+        console.log('[ORDER-ACTION] Notification dismissed');
+      } catch (error: any) {
+        // FAILURE: keep the notification visible so the user can see it
+        // and potentially retry by tapping the app.
+        const errorMsg = error?.message || String(error);
+        console.error(`[ORDER-ACTION] API call failed for ${actionName} on order ${orderId}:`, errorMsg);
+
+        // Do NOT dismiss the notification on failure — it stays visible
+        // as a persistent indicator that the action did not complete.
+      }
     };
   });
 }

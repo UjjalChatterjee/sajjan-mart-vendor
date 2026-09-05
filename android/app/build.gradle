@@ -119,7 +119,8 @@ dependencies {
         implementation jscFlavor
     }
 
-    // Firebase Messaging — needed for CustomMessagingService to extend FirebaseMessagingService
+    // Firebase Messaging — required by @react-native-firebase/messaging and
+    // for the RemoteMessage type used throughout the native layer.
     implementation platform("com.google.firebase:firebase-bom:34.16.0")
     implementation "com.google.firebase:firebase-messaging"
 }

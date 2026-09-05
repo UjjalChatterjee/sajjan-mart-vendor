@@ -1,14 +1,11 @@
 package com.sajjanmart
 
-import android.app.Notification
-import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.media.AudioAttributes
-import android.media.RingtoneManager
-import android.os.Build
+import android.media.MediaPlayer
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.facebook.react.bridge.Promise
@@ -30,6 +27,10 @@ import com.facebook.react.modules.core.DeviceEventManagerModule
 class NotificationHelperModule(reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
 
+    // Direct MediaPlayer for foreground-only sound (no notification)
+    private var foregroundPlayer: MediaPlayer? = null
+    private var foregroundPlaying = false
+
     companion object {
         private const val TAG = "NotificationHelper"
         const val MODULE_NAME = "NotificationHelper"
@@ -40,37 +41,35 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
         const val ACTION_REJECT = "com.sajjanmart.ORDER_REJECT"
         const val EXTRA_ORDER_ID = "order_id"
         const val EXTRA_ACTION = "order_action"
+
+        @Volatile
+        var instance: NotificationHelperModule? = null
+            private set
+    }
+
+    init {
+        instance = this
+    }
+
+    override fun invalidate() {
+        super.invalidate()
+        if (instance == this) {
+            instance = null
+        }
     }
 
     override fun getName(): String = MODULE_NAME
 
     /* ── Channel ── */
 
+    /**
+     * Delegate channel creation to OrderAlertService.ensureNotificationChannel()
+     * — the single source of truth for the urgent order-alert channel.
+     * Creating the channel from two places with different configs would be
+     * unpredictable: whichever runs first wins and the second is ignored.
+     */
     private fun ensureChannel(): String {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val nm = reactApplicationContext.getSystemService(NotificationManager::class.java)
-            if (nm.getNotificationChannel(CHANNEL_ID) == null) {
-                val channel = NotificationChannel(
-                    CHANNEL_ID,
-                    CHANNEL_NAME,
-                    NotificationManager.IMPORTANCE_HIGH,
-                ).apply {
-                    description = CHANNEL_DESC
-                    enableVibration(true)
-                    vibrationPattern = longArrayOf(200, 100, 200)
-                    enableLights(true)
-                    setSound(
-                        RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION),
-                        AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_NOTIFICATION)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                            .build()
-                    )
-                    lockscreenVisibility = Notification.VISIBILITY_PUBLIC
-                }
-                nm.createNotificationChannel(channel)
-            }
-        }
+        OrderAlertService.ensureNotificationChannel(reactApplicationContext)
         return CHANNEL_ID
     }
 
@@ -96,9 +95,13 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
         try {
             val ctx = reactApplicationContext
             val orderId = data.getString("orderId") ?: return
-            val customerName = data.getString("customerName") ?: "New customer"
+            val orderNumber = data.getString("orderNumber") ?: orderId
+            val customerName = data.getString("customerName") ?: "Customer"
+            val customerPhone = data.getString("customerPhone") ?: ""
             val itemCount = data.getString("itemCount") ?: "?"
             val total = data.getString("total") ?: "0"
+            val paymentMethod = data.getString("paymentMethod") ?: ""
+            val address = data.getString("address") ?: ""
 
             val channelId = ensureChannel()
             val notifId = notificationIdFor(orderId)
@@ -117,21 +120,47 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
             )
 
+            val paymentLabel = OrderAlertService.friendlyPaymentMethod(paymentMethod)
+
+            val bigText = buildString {
+                append("Order Number: #$orderNumber\n")
+                if (customerName.isNotEmpty()) append("Customer: $customerName\n")
+                if (customerPhone.isNotEmpty()) append("Phone: $customerPhone\n")
+                if (total.isNotEmpty()) append("Total Amount: ₹$total\n")
+                if (paymentMethod.isNotEmpty()) append("Payment Method: $paymentLabel\n")
+                append("Items: $itemCount\n")
+                if (address.isNotEmpty()) append("\nDelivery Address:\n$address")
+            }.trimEnd()
+
+            val contentText = buildString {
+                append("Order #$orderNumber")
+                if (customerName.isNotEmpty()) append(" • $customerName")
+                if (total.isNotEmpty()) append(" • ₹$total")
+                if (paymentMethod.isNotEmpty()) append(" ($paymentLabel)")
+            }
+
             // ── Build notification ──
             val notification = NotificationCompat.Builder(ctx, channelId)
-                .setSmallIcon(android.R.drawable.ic_popup_reminder)
-                .setContentTitle("Sajjan Mart")
-                .setContentText("New Order #$orderId")
+                .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                .setColor(0xFF16A34A.toInt())
+                .setColorized(true)
+                .setContentTitle("NEW ORDER")
+                .setSubText("#$orderNumber")
+                .setContentText(contentText)
                 .setStyle(
                     NotificationCompat.BigTextStyle()
-                        .bigText("New Order #$orderId\n$customerName • $itemCount items\n₹$total")
+                        .setBigContentTitle("NEW ORDER")
+                        .setSummaryText("#$orderNumber")
+                        .bigText(bigText)
                 )
-                .setPriority(NotificationCompat.PRIORITY_HIGH)
-                .setCategory(NotificationCompat.CATEGORY_MESSAGE)
-                .setAutoCancel(true)
+                .setPriority(NotificationCompat.PRIORITY_MAX)
+                .setCategory(NotificationCompat.CATEGORY_ALARM)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .setAutoCancel(false)
+                .setOngoing(true)
                 .setContentIntent(tapPending)
-                .addAction(0, "REJECT", rejectIntent)
-                .addAction(0, "ACCEPT", acceptIntent)
+                .addAction(android.R.drawable.ic_menu_send, "ACCEPT", acceptIntent)
+                .addAction(android.R.drawable.ic_menu_close_clear_cancel, "REJECT", rejectIntent)
                 .build()
 
             val nm = ctx.getSystemService(NotificationManager::class.java)
@@ -155,11 +184,88 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
         nm.cancel(notificationIdFor(orderId))
     }
 
-    /* ── Alert Sound ── */
+    /* ── Alert Sound (Foreground: sound only, no notification) ── */
+
+    /**
+     * Play alert.mp3 directly via MediaPlayer — NO foreground service,
+     * NO notification. Used by the in-app modal when the app is in
+     * the foreground so no system notification appears over the popup.
+     *
+     * JS call: NotificationHelper.startForegroundSound()
+     */
+    @ReactMethod
+    fun startForegroundSound() {
+        if (foregroundPlaying) {
+            Log.d(TAG, "[ORDER-ALERT] Foreground sound already playing, skipping")
+            return
+        }
+        foregroundPlaying = true
+        try {
+            val resId = reactApplicationContext.resources.getIdentifier(
+                "alert", "raw", reactApplicationContext.packageName
+            )
+            if (resId == 0) {
+                Log.e(TAG, "alert.mp3 not found in res/raw")
+                foregroundPlaying = false
+                return
+            }
+            foregroundPlayer = MediaPlayer().apply {
+                setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ALARM)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build()
+                )
+                setDataSource(
+                    reactApplicationContext,
+                    android.net.Uri.parse("android.resource://${reactApplicationContext.packageName}/$resId")
+                )
+                isLooping = true
+                setOnPreparedListener {
+                    if (foregroundPlayer != null) {
+                        start()
+                        Log.d(TAG, "[ORDER-ALERT] Foreground sound started")
+                    }
+                }
+                setOnErrorListener { _, what, extra ->
+                    Log.e(TAG, "Foreground sound error: what=$what extra=$extra")
+                    foregroundPlaying = false
+                    false
+                }
+                prepareAsync()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start foreground sound", e)
+            foregroundPlaying = false
+        }
+    }
+
+    /**
+     * Stop foreground alert playback immediately.
+     * Safe to call multiple times.
+     */
+    @ReactMethod
+    fun stopForegroundSound() {
+        val player = foregroundPlayer
+        foregroundPlayer = null
+        foregroundPlaying = false
+        try {
+            player?.apply {
+                try { if (isPlaying) stop() } catch (_: IllegalStateException) {}
+                release()
+            }
+            Log.d(TAG, "[ORDER-ALERT] Foreground sound stopped")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error stopping foreground sound", e)
+        }
+    }
+
+    /* ── Alert Sound (Background/Killed: foreground service with notification) ── */
 
     /**
      * Start the foreground order alert service (loops alert.mp3).
-     * Supports full order data including items, phone, address, payment.
+     * Shows a persistent notification with ACCEPT / REJECT actions.
+     * Used for background/killed states only.
      *
      * JS call:
      *   NotificationHelper.startOrderAlert({
@@ -205,23 +311,30 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
      * Emits a "NotificationAction" event to JS.
      */
     fun emitActionToJS(action: String, orderId: String) {
-        Log.d(TAG, "[ORDER-ACTION] Emitting to JS: $action for order $orderId")
-        val params = com.facebook.react.bridge.Arguments.createMap().apply {
-            putString("action", action)
-            putString("orderId", orderId)
+        try {
+            if (reactApplicationContext.hasActiveReactInstance()) {
+                Log.d(TAG, "[ORDER-ACTION] Emitting to JS: $action for order $orderId")
+                val params = com.facebook.react.bridge.Arguments.createMap().apply {
+                    putString("action", action)
+                    putString("orderId", orderId)
+                }
+                reactApplicationContext
+                    .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+                    .emit("NotificationAction", params)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not emit action to JS: ${e.message}")
         }
-        reactApplicationContext
-            .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
-            .emit("NotificationAction", params)
     }
 
     /* ── Helpers ── */
 
-    private fun createActionIntent(ctx: Context, action: String, orderId: String): PendingIntent {
+    private fun createActionIntent(ctx: Context, action: String, orderId: String, orderNumber: String = orderId): PendingIntent {
         val intent = Intent(ctx, NotificationActionReceiver::class.java).apply {
             this.action = action
             putExtra(EXTRA_ORDER_ID, orderId)
             putExtra(EXTRA_ACTION, action)
+            putExtra("orderNumber", orderNumber)
         }
         // Use orderId hashCode as request code so each notification gets unique PendingIntents
         val requestCode = orderId.hashCode() or (if (action == ACTION_ACCEPT) 0x10000 else 0x20000)

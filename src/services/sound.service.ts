@@ -3,9 +3,13 @@
  *
  * Manages continuous order-alert audio playback.
  *
- * Foreground: uses the native OrderAlertService via NativeModules.
- * Background/Killed: the native Foreground Service handles playback
- * independently of the React Native JS runtime.
+ * Foreground: plays alert.mp3 directly via NotificationHelperModule
+ *   (MediaPlayer only — no foreground service, no notification).
+ *   The in-app modal IS the foreground UI.
+ *
+ * Background/Killed: the native OrderAlertService foreground service
+ *   handles playback independently of the React Native JS runtime.
+ *   CustomMessagingReceiver starts it directly.
  *
  * Flow:
  *   New Order  →  startOrderAlertSound()  →  alert.mp3 loops
@@ -27,6 +31,10 @@ export interface OrderAlertData {
 /* ── Native bridge ── */
 
 interface NativeSoundModule {
+  /** Foreground: sound only, no notification */
+  startForegroundSound(): void;
+  stopForegroundSound(): void;
+  /** Background/killed: foreground service with notification */
   startOrderAlert(data: {
     orderId: string;
     customerName: string;
@@ -63,12 +71,10 @@ export function startOrderAlertSound(data: OrderAlertData): void {
   }
 
   if (NativeSound) {
-    NativeSound.startOrderAlert({
-      orderId: data.orderId,
-      customerName: data.customerName ?? '',
-      itemCount: data.itemCount ?? '',
-      total: data.total ?? '',
-    });
+    // Use foreground-only audio method: plays alert.mp3 directly via
+    // MediaPlayer without starting a foreground service or showing a
+    // notification. The modal popup IS the foreground UI.
+    NativeSound.startForegroundSound();
   } else {
     if (__DEV__) {
       console.log('[SOUND] Native module unavailable — sound will not play');
@@ -90,7 +96,7 @@ export function stopOrderAlertSound(): void {
   activeOrderId = null;
 
   if (NativeSound) {
-    NativeSound.stopOrderAlert();
+    NativeSound.stopForegroundSound();
   }
 
   if (__DEV__) {
