@@ -24,7 +24,7 @@ const DEV_BASE_URL =
 
 export const Env = {
   /** REST API base — no trailing slash */
-  API_BASE_URL: __DEV__ ? DEV_BASE_URL : 'https://api.sajjanmart.com',
+  API_BASE_URL: __DEV__ ? DEV_BASE_URL : 'https://sajjan-mart.onrender.com',
 
   /** API timeout in milliseconds */
   API_TIMEOUT: 15_000,
