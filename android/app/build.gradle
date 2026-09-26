@@ -79,13 +79,14 @@ android {
     compileSdk rootProject.ext.compileSdkVersion
 
     namespace "com.sajjanmart"
-    defaultConfig {
-        applicationId "com.sajjanmart"
-        minSdkVersion rootProject.ext.minSdkVersion
-        targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
-    }
+   defaultConfig {
+    applicationId "com.sajjanmart"
+    minSdkVersion rootProject.ext.minSdkVersion
+    targetSdkVersion rootProject.ext.targetSdkVersion
+
+    versionCode 1
+    versionName "1.0.0"
+}
    signingConfigs {
     debug {
         storeFile file('debug.keystore')
@@ -115,6 +116,14 @@ android {
             signingConfig signingConfigs.release
             minifyEnabled enableProguardInReleaseBuilds
             proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+        }
+    }
+
+     applicationVariants.all { variant ->
+        if (variant.buildType.name == "release") {
+            variant.outputs.all { output ->
+                outputFileName = "SajjanMart-v${variant.versionName}.apk"
+            }
         }
     }
 }
