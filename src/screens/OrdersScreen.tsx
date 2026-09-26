@@ -7,6 +7,7 @@ import {
   TouchableOpacity,
   ScrollView,
   Image,
+  PanResponder,
 } from 'react-native';
 import {
   SafeAreaView,
@@ -429,6 +430,36 @@ export function OrdersScreen() {
       new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
   );
 
+  // Horizontal swipe between tabs (right→left = next, left→right = previous)
+  const swipeTabBy = useCallback(
+    (dir: 1 | -1) => {
+      const index = FIXED_TABS.findIndex(t => t.key === activeTab);
+      const target = FIXED_TABS[index + dir];
+      if (!target) return;
+      setActiveTab(target.key);
+    },
+    [activeTab],
+  );
+  const swipeTabRef = useRef(swipeTabBy);
+  swipeTabRef.current = swipeTabBy;
+
+  const listSwipePan = useRef(
+    PanResponder.create({
+      // Claim only clearly horizontal drags so vertical list scrolling and
+      // pull-to-refresh are untouched
+      onMoveShouldSetPanResponder: (_e, g) =>
+        Math.abs(g.dx) > 12 && Math.abs(g.dx) > Math.abs(g.dy) * 1.5,
+      onPanResponderRelease: (_e, g) => {
+        const SWIPE_THRESHOLD = 50;
+        if (g.dx <= -SWIPE_THRESHOLD) {
+          swipeTabRef.current(1);
+        } else if (g.dx >= SWIPE_THRESHOLD) {
+          swipeTabRef.current(-1);
+        }
+      },
+    }),
+  ).current;
+
   // Modal actions — delegate to store + invalidate cache
   const handleModalAccept = useCallback(
     async (orderId: string) => {
@@ -537,111 +568,113 @@ export function OrdersScreen() {
         })}
       </ScrollView>
 
-      {/* Order List */}
-      {isLoading && !hasEverLoaded.current ? (
-        <View>
+      {/* Order List — horizontal swipe switches tabs */}
+      <View style={styles.listSwipeArea} {...listSwipePan.panHandlers}>
+        {isLoading && !hasEverLoaded.current ? (
           <View>
-            <OrderCardSkeleton />
-            <OrderCardSkeleton />
-            <OrderCardSkeleton />
+            <View>
+              <OrderCardSkeleton />
+              <OrderCardSkeleton />
+              <OrderCardSkeleton />
+            </View>
           </View>
-        </View>
-      ) : filteredOrders.length === 0 ? (
-        <View style={styles.emptyContainer}>
-          <EmptyState
-            title={`No ${activeTabDef.label} orders`}
-            subtitle={`${activeTabDef.label} orders will show up here.`}
-            icon={'🛒'}
-          />
-        </View>
-      ) : (
-        <FlatList
-          style={styles.orderList}
-          data={filteredOrders}
-          keyExtractor={item => item.id}
-          contentContainerStyle={[
-            styles.orderListContent,
-            {
-              paddingBottom: insets.bottom + 24,
-            },
-          ]}
-          showsVerticalScrollIndicator={false}
-          refreshing={isFetching && !isLoading}
-          onRefresh={handleRefresh}
-          renderItem={({ item }) => {
-            if (item.status === 'cancel_request') {
+        ) : filteredOrders.length === 0 ? (
+          <View style={styles.emptyContainer}>
+            <EmptyState
+              title={`No ${activeTabDef.label} orders`}
+              subtitle={`${activeTabDef.label} orders will show up here.`}
+              icon={'🛒'}
+            />
+          </View>
+        ) : (
+          <FlatList
+            style={styles.orderList}
+            data={filteredOrders}
+            keyExtractor={item => item.id}
+            contentContainerStyle={[
+              styles.orderListContent,
+              {
+                paddingBottom: insets.bottom + 24,
+              },
+            ]}
+            showsVerticalScrollIndicator={false}
+            refreshing={isFetching && !isLoading}
+            onRefresh={handleRefresh}
+            renderItem={({ item }) => {
+              if (item.status === 'cancel_request') {
+                return (
+                  <CancelRequestOrderCard
+                    order={item}
+                    onApproveItem={async () => {
+                      await cancelApproveItems(item.id, []);
+                    }}
+                    onRejectItem={async () => {
+                      await cancelRejectItems(item.id, []);
+                    }}
+                    onApproveSelected={async (_orderId, itemIds) => {
+                      await cancelApproveItems(item.id, itemIds);
+                    }}
+                    onRejectSelected={async (_orderId, itemIds) => {
+                      await cancelRejectItems(item.id, itemIds);
+                    }}
+                    queryClient={queryClient}
+                    showSuccess={showSuccess}
+                    showError={showError}
+                  />
+                );
+              }
+
               return (
-                <CancelRequestOrderCard
+                <OrderCard
                   order={item}
-                  onApproveItem={async () => {
-                    await cancelApproveItems(item.id, []);
+                  isAccepting={acceptingId === item.id}
+                  onAccept={async orderId => {
+                    setAcceptingId(orderId);
+                    try {
+                      await acceptOrder(orderId);
+                      queryClient.invalidateQueries({ queryKey: ['orders'] });
+                      showSuccess('Order accepted successfully');
+                    } catch (err) {
+                      setErrorModalMessage(
+                        err instanceof Error ? err.message : 'Failed to accept order',
+                      );
+                      setErrorModalVisible(true);
+                    } finally {
+                      setAcceptingId(null);
+                    }
                   }}
-                  onRejectItem={async () => {
-                    await cancelRejectItems(item.id, []);
+                  isRejecting={rejectingId === item.id}
+                  onReject={async orderId => {
+                    setRejectingId(orderId);
+
+                    try {
+                      await rejectOrder(orderId);
+                      queryClient.invalidateQueries({ queryKey: ['orders'] });
+                      showSuccess('Order rejected successfully');
+                    } catch (err) {
+                      setErrorModalMessage(
+                        err instanceof Error
+                          ? err.message
+                          : 'Failed to reject order',
+                      );
+                      setErrorModalVisible(true);
+                    } finally {
+                      setRejectingId(null);
+                    }
                   }}
-                  onApproveSelected={async (_orderId, itemIds) => {
-                    await cancelApproveItems(item.id, itemIds);
-                  }}
-                  onRejectSelected={async (_orderId, itemIds) => {
-                    await cancelRejectItems(item.id, itemIds);
-                  }}
-                  queryClient={queryClient}
-                  showSuccess={showSuccess}
-                  showError={showError}
+                  onMarkDispatched={handleMarkDispatched}
+                  isDispatching={dispatchingId === item.id}
+                  onItemReady={handleItemReady}
+                  onItemCancel={handleItemCancel}
+                  processingItems={processingItems}
+                  onMarkDelivered={handleMarkDelivered}
+                  isDelivering={deliveringId === item.id}
                 />
               );
-            }
-
-            return (
-              <OrderCard
-                order={item}
-                isAccepting={acceptingId === item.id}
-                onAccept={async orderId => {
-                  setAcceptingId(orderId);
-                  try {
-                    await acceptOrder(orderId);
-                    queryClient.invalidateQueries({ queryKey: ['orders'] });
-                    showSuccess('Order accepted successfully');
-                  } catch (err) {
-                    setErrorModalMessage(
-                      err instanceof Error ? err.message : 'Failed to accept order',
-                    );
-                    setErrorModalVisible(true);
-                  } finally {
-                    setAcceptingId(null);
-                  }
-                }}
-                isRejecting={rejectingId === item.id}
-                onReject={async orderId => {
-                  setRejectingId(orderId);
-
-                  try {
-                    await rejectOrder(orderId);
-                    queryClient.invalidateQueries({ queryKey: ['orders'] });
-                    showSuccess('Order rejected successfully');
-                  } catch (err) {
-                    setErrorModalMessage(
-                      err instanceof Error
-                        ? err.message
-                        : 'Failed to reject order',
-                    );
-                    setErrorModalVisible(true);
-                  } finally {
-                    setRejectingId(null);
-                  }
-                }}
-                onMarkDispatched={handleMarkDispatched}
-                isDispatching={dispatchingId === item.id}
-                onItemReady={handleItemReady}
-                onItemCancel={handleItemCancel}
-                processingItems={processingItems}
-                onMarkDelivered={handleMarkDelivered}
-                isDelivering={deliveringId === item.id}
-              />
-            );
-          }}
-        />
-      )}
+            }}
+          />
+        )}
+      </View>
 
       {/* New Order Alert — the ONLY place with Accept/Reject */}
       <NewOrderAlertModal
@@ -773,6 +806,10 @@ const styles = StyleSheet.create({
   },
 
   // Order list
+  listSwipeArea: {
+    flex: 1,
+  },
+
   orderList: {
     flex: 1,
     minHeight: 0,
