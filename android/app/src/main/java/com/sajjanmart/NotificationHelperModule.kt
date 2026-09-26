@@ -463,6 +463,43 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
         }
     }
 
+    /* ── Notification tap (NEW_ORDER notification click → JS) ── */
+
+    /**
+     * Called by MainActivity when a NEW_ORDER notification is tapped while the
+     * app is running. Emits "NotificationTap" to JS and clears the stash so a
+     * later getTappedOrderId() cannot re-open the same order.
+     */
+    fun emitTapToJS(orderId: String) {
+        try {
+            if (reactApplicationContext.hasActiveReactInstance()) {
+                Log.d(TAG, "[ORDER-TAP] Emitting tap to JS for order $orderId")
+                val params = com.facebook.react.bridge.Arguments.createMap().apply {
+                    putString("orderId", orderId)
+                }
+                reactApplicationContext
+                    .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+                    .emit("NotificationTap", params)
+                MainActivity.pendingTapOrderId = null
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not emit tap to JS: ${e.message}")
+        }
+    }
+
+    /**
+     * JS call: NotificationHelper.getTappedOrderId() → Promise<string | null>.
+     * Returns and clears the order_id stashed by MainActivity from a
+     * NEW_ORDER notification tap (cold start path).
+     */
+    @ReactMethod
+    fun getTappedOrderId(promise: Promise) {
+        val orderId = MainActivity.pendingTapOrderId
+        MainActivity.pendingTapOrderId = null
+        Log.d(TAG, "[ORDER-TAP] getTappedOrderId → ${orderId ?: "null"}")
+        promise.resolve(orderId)
+    }
+
     /* ── Helpers ── */
 
     private fun createActionIntent(ctx: Context, action: String, orderId: String, orderNumber: String = orderId): PendingIntent {

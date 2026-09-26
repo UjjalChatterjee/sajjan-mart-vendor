@@ -21,13 +21,17 @@ import { useNavigation } from '../context/NavigationContext';
 import { useOrderStore } from '../store/orderStore';
 import { useToast } from '../context/ToastContext';
 import { useOrders } from '../hooks/useOrders';
-import { processOrderItem, markOrderDispatched, markOrderDelivered, cancelApproveItems, cancelRejectItems } from '../services/order.service';
+import { processOrderItem, markOrderDispatched, markOrderDelivered, cancelApproveItems, cancelRejectItems, getOrders } from '../services/order.service';
 import {
   setIncomingOrderHandler,
   removeIncomingOrderHandler,
   setNotificationActionHandler,
   removeNotificationActionHandler,
   handleInitialNotification,
+  consumeTappedOrderId,
+  setTappedOrderHandler,
+  removeTappedOrderHandler,
+  stopNativeOrderAlert,
 } from '../services/notification.service';
 import { ErrorModal } from '../components/ErrorModal';
 import { CancelRequestOrderCard } from '../components/CancelRequestOrderCard';
@@ -148,6 +152,8 @@ export function OrdersScreen() {
   const [activeTab, setActiveTab] = useState('new_order');
   const [newOrderVisible, setNewOrderVisible] = useState(false);
   const [pendingNewOrder, setPendingNewOrder] = useState<Order | null>(null);
+  // Order ids already surfaced via notification tap — prevents double-open popups
+  const tappedOrderIds = useRef<Set<string>>(new Set());
   const [errorModalVisible, setErrorModalVisible] = useState(false);
   const [errorModalMessage, setErrorModalMessage] = useState('');
   const [acceptingId, setAcceptingId] = useState<string | null>(null);
@@ -226,17 +232,73 @@ export function OrdersScreen() {
       setNewOrderVisible(true);
     });
 
+    // NEW_ORDER notification tap: open the same modal (deduped by order id)
+    const openTappedOrder = (orderId: string) => {
+      if (!orderId || tappedOrderIds.current.has(orderId)) {
+        return;
+      }
+      tappedOrderIds.current.add(orderId);
+      console.log('[ORDER-ALERT] Incoming order via notification tap');
+
+      // Stop the native OrderAlertService (sound + volume bump) before the
+      // foreground alert starts, so the two audio owners never overlap.
+      stopNativeOrderAlert();
+
+      const openWithFallback = () => {
+        const fallback = buildOrderFromNotification({
+          orderId,
+          customerName: '',
+          itemCount: '0',
+          total: '0',
+        });
+        setPendingNewOrder(fallback);
+        setNewOrderVisible(true);
+      };
+
+      // Fetch the complete order so the modal shows real details
+      getOrders()
+        .then(orders => {
+          const full = orders.find(o => o.id === orderId);
+          if (full) {
+            setPendingNewOrder(full);
+            setNewOrderVisible(true);
+          } else {
+            openWithFallback();
+          }
+        })
+        .catch(() => openWithFallback());
+    };
+
     // Process any pending notification from killed-state launch
     handleInitialNotification().then(data => {
       if (data) {
         console.log('[ORDER-ALERT] Pending order from killed-state launch');
+        if (data.orderId && tappedOrderIds.current.has(data.orderId)) {
+          return;
+        }
+        if (data.orderId) {
+          tappedOrderIds.current.add(data.orderId);
+        }
         const incoming = buildOrderFromNotification(data);
         setPendingNewOrder(incoming);
         setNewOrderVisible(true);
       }
     });
 
-    return () => removeIncomingOrderHandler();
+    // Cold start via notification tap: pull the stashed order id
+    consumeTappedOrderId().then(orderId => {
+      if (orderId) {
+        openTappedOrder(orderId);
+      }
+    });
+
+    // Tap while the app is running: MainActivity pushes the order id
+    setTappedOrderHandler(openTappedOrder);
+
+    return () => {
+      removeIncomingOrderHandler();
+      removeTappedOrderHandler();
+    };
   }, []);
 
   // Register notification action handler (ACCEPT/REJECT from notification buttons)

@@ -62,9 +62,11 @@ export type NotificationActionHandler = (payload: NotificationActionPayload) => 
 
 let onIncomingOrder: IncomingOrderHandler | null = null;
 let onNotificationAction: NotificationActionHandler | null = null;
+let onTappedOrder: ((orderId: string) => void) | null = null;
 let unsubscribeForeground: (() => void) | null = null;
 let unsubscribeNotificationOpened: (() => void) | null = null;
 let unsubscribeActionEvent: { remove: () => void } | null = null;
+let unsubscribeTapEvent: { remove: () => void } | null = null;
 let unsubscribeTokenRefresh: (() => void) | null = null;
 
 // Duplicate protection: track processed order+action combos
@@ -95,6 +97,7 @@ const NATIVE_MODULE = NativeModules.NotificationHelper as
         items: string;
       }) => void;
       stopOrderAlert: () => void;
+      getTappedOrderId: () => Promise<string | null>;
     }
   | undefined;
 
@@ -230,6 +233,7 @@ export async function initializeNotifications(): Promise<void> {
   startForegroundListener();
   startNotificationOpenedListener();
   startActionEventListener();
+  startTapEventListener();
 
   if (__DEV__) {
     console.log('[FCM] Initialization complete');
@@ -340,6 +344,55 @@ export function startNativeOrderAlert(data: OrderNotificationData): void {
 export function stopNativeOrderAlert(): void {
   if (Platform.OS !== 'android' || !NATIVE_MODULE) return;
   NATIVE_MODULE.stopOrderAlert();
+}
+
+/* ──────────────────────────────────────────────────────────────────────
+ * Notification Tap (NEW_ORDER notification click → JS)
+ *
+ * Cold start: MainActivity stashes order_id → JS pulls consumeTappedOrderId().
+ * App running: MainActivity pushes "NotificationTap" → tap event listener.
+ * ────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Pull (and clear) the order id stashed by MainActivity from a
+ * NEW_ORDER notification tap. Resolves null when there is no pending tap.
+ */
+export function consumeTappedOrderId(): Promise<string | null> {
+  if (Platform.OS !== 'android' || !NATIVE_MODULE) {
+    return Promise.resolve(null);
+  }
+  return NATIVE_MODULE.getTappedOrderId();
+}
+
+export function setTappedOrderHandler(
+  handler: ((orderId: string) => void) | null,
+): void {
+  onTappedOrder = handler;
+}
+
+export function removeTappedOrderHandler(): void {
+  onTappedOrder = null;
+}
+
+/** Listen for notification-tap events pushed by MainActivity while the app is alive. */
+function startTapEventListener(): void {
+  if (unsubscribeTapEvent) {
+    unsubscribeTapEvent.remove();
+  }
+
+  unsubscribeTapEvent = DeviceEventEmitter.addListener(
+    'NotificationTap',
+    (payload: { orderId?: string }) => {
+      if (__DEV__) {
+        console.log(
+          `[ORDER-TAP] Notification tapped for order ${payload?.orderId ?? 'unknown'}`,
+        );
+      }
+      if (payload?.orderId && onTappedOrder) {
+        onTappedOrder(payload.orderId);
+      }
+    },
+  );
 }
 
 /* ──────────────────────────────────────────────────────────────────────
