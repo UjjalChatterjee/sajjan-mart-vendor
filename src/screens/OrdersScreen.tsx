@@ -6,6 +6,7 @@ import {
   FlatList,
   TouchableOpacity,
   ScrollView,
+  Image,
 } from 'react-native';
 import {
   SafeAreaView,
@@ -428,8 +429,6 @@ export function OrdersScreen() {
       new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
   );
 
-  const pendingCount = orders.filter(o => o.status === 'pending').length;
-
   // Modal actions — delegate to store + invalidate cache
   const handleModalAccept = useCallback(
     async (orderId: string) => {
@@ -480,27 +479,12 @@ export function OrdersScreen() {
       {/* Header */}
       <View style={styles.header}>
         <View style={styles.headerLeft}>
-          <View style={styles.headerLogo}>
-            <View style={styles.logoMark}>
-              <View style={styles.logoLeafTop} />
-              <View style={styles.logoLeafBottom} />
-            </View>
-          </View>
-          <Text style={styles.headerTitle}>Orders</Text>
-          {pendingCount > 0 && (
-            <View style={styles.pendingBadge}>
-              <Text style={styles.pendingBadgeText}>{pendingCount}</Text>
-            </View>
-          )}
+          <Image
+            source={require('../assets/logo_square.png')}
+            style={styles.headerLogoImage}
+          />
         </View>
         <View style={styles.headerRight}>
-          <TouchableOpacity
-            style={styles.iconBtn}
-            activeOpacity={0.6}
-            onPress={() => navigate('notifications')}
-          >
-            <Text style={styles.iconEmoji}>🔔</Text>
-          </TouchableOpacity>
           <TouchableOpacity
             style={styles.avatar}
             activeOpacity={0.6}
@@ -698,74 +682,15 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 10,
   },
-  headerLogo: {
+  headerLogoImage: {
     width: 36,
     height: 36,
     borderRadius: 10,
-    backgroundColor: Colors.primary,
-    alignItems: 'center',
-    justifyContent: 'center',
-    overflow: 'hidden',
-  },
-  logoMark: {
-    position: 'relative',
-    width: 36,
-    height: 36,
-  },
-  logoLeafTop: {
-    position: 'absolute',
-    width: 16,
-    height: 16,
-    borderRadius: 8,
-    backgroundColor: 'rgba(255,255,255,0.9)',
-    top: 8,
-    left: 6,
-  },
-  logoLeafBottom: {
-    position: 'absolute',
-    width: 11,
-    height: 11,
-    borderRadius: 6,
-    backgroundColor: Colors.primaryLight,
-    top: 12,
-    left: 10,
-  },
-  headerTitle: {
-    fontSize: 21,
-    fontWeight: '700',
-    color: Colors.gray900,
-  },
-  pendingBadge: {
-    backgroundColor: Colors.pending,
-    borderRadius: 12,
-    minWidth: 24,
-    height: 24,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 7,
-  },
-  pendingBadgeText: {
-    color: Colors.white,
-    fontSize: 12,
-    fontWeight: '700',
   },
   headerRight: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
-  },
-  iconBtn: {
-    width: 38,
-    height: 38,
-    borderRadius: 12,
-    backgroundColor: Colors.white,
-    borderWidth: 1,
-    borderColor: '#E5E7EB',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  iconEmoji: {
-    fontSize: 17,
   },
   avatar: {
     width: 36,

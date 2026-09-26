@@ -13,40 +13,10 @@ import { useToast } from '../context/ToastContext';
 import { logout } from '../services/auth.service';
 import { ConfirmModal, LogoutIcon } from '../components/ConfirmModal';
 
-/* ── Row component ── */
-
-function SettingsRow({
-  icon,
-  title,
-  subtitle,
-  onPress,
-}: {
-  icon: string;
-  title: string;
-  subtitle: string;
-  onPress: () => void;
-}) {
-  return (
-    <TouchableOpacity
-      style={styles.row}
-      onPress={onPress}
-      activeOpacity={0.6}>
-      <View style={styles.rowIcon}>
-        <Text style={styles.rowIconText}>{icon}</Text>
-      </View>
-      <View style={styles.rowInfo}>
-        <Text style={styles.rowTitle}>{title}</Text>
-        <Text style={styles.rowSubtitle}>{subtitle}</Text>
-      </View>
-      <Text style={styles.rowArrow}>›</Text>
-    </TouchableOpacity>
-  );
-}
-
 /* ── Screen ── */
 
 export function SettingsScreen() {
-  const { navigate, goBack, resetHistoryToLogin } = useNavigation();
+  const { goBack, resetHistoryToLogin } = useNavigation();
   const { signOut } = useAuth();
   const { showSuccess } = useToast();
   const [logoutVisible, setLogoutVisible] = React.useState(false);
@@ -75,24 +45,6 @@ export function SettingsScreen() {
 
       {/* Settings list */}
       <View style={styles.content}>
-        <View style={styles.card}>
-          <SettingsRow
-            icon="🔒"
-            title="Change Password"
-            subtitle="Update your account password"
-            onPress={() => {/* TODO: navigate to change password */}}
-          />
-
-          <View style={styles.divider} />
-
-          <SettingsRow
-            icon="🔔"
-            title="Order Notifications"
-            subtitle="Manage new order alerts"
-            onPress={() => navigate('notifications')}
-          />
-        </View>
-
         {/* Logout */}
         <TouchableOpacity
           style={styles.logoutBtn}
@@ -166,61 +118,6 @@ const styles = StyleSheet.create({
     flex: 1,
     paddingHorizontal: 18,
     paddingTop: 8,
-  },
-  // Card
-  card: {
-    backgroundColor: Colors.white,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: '#E5E7EB',
-    marginBottom: 24,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.04,
-    shadowRadius: 4,
-    elevation: 1,
-  },
-  // Row
-  row: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 16,
-  },
-  rowIcon: {
-    width: 38,
-    height: 38,
-    borderRadius: 10,
-    backgroundColor: '#F9FAFB',
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginRight: 14,
-  },
-  rowIconText: {
-    fontSize: 18,
-  },
-  rowInfo: {
-    flex: 1,
-  },
-  rowTitle: {
-    fontSize: 15,
-    fontWeight: '600',
-    color: Colors.gray800,
-    marginBottom: 2,
-  },
-  rowSubtitle: {
-    fontSize: 13,
-    color: Colors.gray500,
-  },
-  rowArrow: {
-    fontSize: 22,
-    color: Colors.gray300,
-    fontWeight: '400',
-  },
-  divider: {
-    height: 1,
-    backgroundColor: '#F3F4F6',
-    marginLeft: 68,
   },
   // Logout
   logoutBtn: {
