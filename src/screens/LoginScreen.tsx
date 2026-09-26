@@ -9,6 +9,7 @@ import {
   Dimensions,
   Animated,
   Easing,
+  Image,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Colors } from '../theme/colors';
@@ -43,12 +44,10 @@ const { width: SCREEN_WIDTH } = Dimensions.get('window');
 function BrandMark() {
   return (
     <View style={logoStyles.container}>
-      {/* Green rounded square base */}
-      <View style={logoStyles.base}>
-        {/* White leaf accent — two overlapping circles */}
-        <View style={logoStyles.leafTop} />
-        <View style={logoStyles.leafBottom} />
-      </View>
+      <Image
+        source={require('../assets/logo_square.png')}
+        style={logoStyles.logo}
+      />
     </View>
   );
 }
@@ -60,36 +59,18 @@ const logoStyles = StyleSheet.create({
     width: LOGO_SIZE,
     height: LOGO_SIZE,
     marginBottom: 20,
-  },
-  base: {
-    width: LOGO_SIZE,
-    height: LOGO_SIZE,
-    borderRadius: 18,
-    backgroundColor: Colors.primary,
+    borderRadius: 16,
     overflow: 'hidden',
+    backgroundColor: Colors.white,
     shadowColor: Colors.primary,
     shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.25,
     shadowRadius: 10,
     elevation: 6,
   },
-  leafTop: {
-    position: 'absolute',
-    width: 30,
-    height: 30,
-    borderRadius: 15,
-    backgroundColor: 'rgba(255,255,255,0.95)',
-    top: 14,
-    left: 12,
-  },
-  leafBottom: {
-    position: 'absolute',
-    width: 22,
-    height: 22,
-    borderRadius: 11,
-    backgroundColor: Colors.primaryLight,
-    top: 20,
-    left: 20,
+  logo: {
+    width: '100%',
+    height: '100%',
   },
 });
 
