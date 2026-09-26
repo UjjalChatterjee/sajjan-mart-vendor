@@ -5,7 +5,10 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.media.MediaPlayer
+import android.os.Build
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.facebook.react.bridge.Promise
@@ -30,6 +33,14 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
     // Direct MediaPlayer for foreground-only sound (no notification)
     private var foregroundPlayer: MediaPlayer? = null
     private var foregroundPlaying = false
+
+    // Foreground loudness handling — mirrors OrderAlertService: temporarily raise
+    // STREAM_ALARM to max and hold AUDIOFOCUS_GAIN for the alert duration, then
+    // restore the previous volume and abandon focus when the alert stops.
+    private var foregroundAudioManager: AudioManager? = null
+    private var foregroundFocusRequest: AudioFocusRequest? = null
+    private var foregroundFocusListener: AudioManager.OnAudioFocusChangeListener? = null
+    private var foregroundPrevVolume = -1
 
     companion object {
         private const val TAG = "NotificationHelper"
@@ -209,6 +220,10 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
                 foregroundPlaying = false
                 return
             }
+
+            captureAndRaiseAlarmVolume()
+            requestForegroundAudioFocus()
+
             foregroundPlayer = MediaPlayer().apply {
                 setAudioAttributes(
                     AudioAttributes.Builder()
@@ -229,7 +244,10 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
                 }
                 setOnErrorListener { _, what, extra ->
                     Log.e(TAG, "Foreground sound error: what=$what extra=$extra")
+                    foregroundPlayer = null
                     foregroundPlaying = false
+                    restoreForegroundVolume()
+                    abandonForegroundAudioFocus()
                     false
                 }
                 prepareAsync()
@@ -237,15 +255,21 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start foreground sound", e)
             foregroundPlaying = false
+            restoreForegroundVolume()
+            abandonForegroundAudioFocus()
         }
     }
 
     /**
-     * Stop foreground alert playback immediately.
-     * Safe to call multiple times.
+     * Stop foreground alert playback immediately, restore the pre-alert alarm
+     * volume and release audio focus. Safe to call multiple times.
      */
     @ReactMethod
     fun stopForegroundSound() {
+        stopForegroundPlayback()
+    }
+
+    private fun stopForegroundPlayback() {
         val player = foregroundPlayer
         foregroundPlayer = null
         foregroundPlaying = false
@@ -257,6 +281,118 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
             Log.d(TAG, "[ORDER-ALERT] Foreground sound stopped")
         } catch (e: Exception) {
             Log.e(TAG, "Error stopping foreground sound", e)
+        }
+        restoreForegroundVolume()
+        abandonForegroundAudioFocus()
+    }
+
+    /* ── Foreground loudness helpers (same approach as OrderAlertService) ── */
+
+    /** Capture the current STREAM_ALARM level and temporarily raise it to the
+     *  stream maximum so a muted/low-volume device still rings. The captured
+     *  level is restored by restoreForegroundVolume() when the alert stops. */
+    private fun captureAndRaiseAlarmVolume() {
+        foregroundAudioManager =
+            reactApplicationContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        val am = foregroundAudioManager ?: return
+        try {
+            foregroundPrevVolume = am.getStreamVolume(AudioManager.STREAM_ALARM)
+            val max = am.getStreamMaxVolume(AudioManager.STREAM_ALARM)
+            if (foregroundPrevVolume < max) {
+                am.setStreamVolume(AudioManager.STREAM_ALARM, max, AudioManager.FLAG_SHOW_UI)
+                Log.d(TAG, "[ORDER-ALERT] Foreground: bumped STREAM_ALARM $foregroundPrevVolume → $max")
+            }
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Cannot temporarily raise alarm volume: ${e.message}")
+        }
+    }
+
+    private fun restoreForegroundVolume() {
+        val am = foregroundAudioManager ?: return
+        if (foregroundPrevVolume < 0) return
+        try {
+            if (am.getStreamVolume(AudioManager.STREAM_ALARM) != foregroundPrevVolume) {
+                am.setStreamVolume(AudioManager.STREAM_ALARM, foregroundPrevVolume, AudioManager.FLAG_SHOW_UI)
+                Log.d(TAG, "[ORDER-ALERT] Foreground: restored STREAM_ALARM to $foregroundPrevVolume")
+            }
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Cannot restore alarm volume: ${e.message}")
+        }
+    }
+
+    /** AUDIOFOCUS_GAIN with USAGE_ALARM attributes, mirroring
+     *  OrderAlertService.requestAudioFocus(). On focus loss the alert stops
+     *  and cleans up so we do not fight another audio owner (e.g. a call). */
+    private fun requestForegroundAudioFocus() {
+        val am = foregroundAudioManager ?: return
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                if (foregroundFocusRequest != null) return
+                val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_ALARM)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                            .build()
+                    )
+                    .setOnAudioFocusChangeListener { focusChange ->
+                        handleForegroundFocusChange(focusChange)
+                    }
+                    .build()
+                if (am.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                    foregroundFocusRequest = request
+                    Log.d(TAG, "[ORDER-ALERT] Foreground: audio focus granted (AUDIOFOCUS_GAIN)")
+                } else {
+                    Log.w(TAG, "[ORDER-ALERT] Foreground: audio focus request not granted")
+                }
+            } else {
+                if (foregroundFocusListener != null) return
+                val listener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+                    handleForegroundFocusChange(focusChange)
+                }
+                if (am.requestAudioFocus(
+                        listener,
+                        AudioManager.STREAM_MUSIC,
+                        AudioManager.AUDIOFOCUS_GAIN,
+                    ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+                ) {
+                    foregroundFocusListener = listener
+                    Log.d(TAG, "[ORDER-ALERT] Foreground: legacy audio focus granted (AUDIOFOCUS_GAIN)")
+                } else {
+                    Log.w(TAG, "[ORDER-ALERT] Foreground: audio focus request not granted")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "[ORDER-ALERT] Foreground: audio focus request failed: ${e.message}")
+            foregroundFocusRequest = null
+            foregroundFocusListener = null
+        }
+    }
+
+    private fun handleForegroundFocusChange(focusChange: Int) {
+        when (focusChange) {
+            AudioManager.AUDIOFOCUS_LOSS,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+            -> {
+                Log.w(TAG, "[ORDER-ALERT] Foreground: lost audio focus ($focusChange) — stopping")
+                stopForegroundPlayback()
+            }
+            else -> {}
+        }
+    }
+
+    private fun abandonForegroundAudioFocus() {
+        val am = foregroundAudioManager ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            foregroundFocusRequest?.let {
+                try { am.abandonAudioFocusRequest(it) } catch (_: Exception) {}
+            }
+            foregroundFocusRequest = null
+        } else {
+            foregroundFocusListener?.let {
+                try { am.abandonAudioFocus(it) } catch (_: Exception) {}
+            }
+            foregroundFocusListener = null
         }
     }
 

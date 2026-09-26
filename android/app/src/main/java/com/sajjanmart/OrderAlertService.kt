@@ -7,8 +7,11 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.ComponentName
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.media.MediaPlayer
 import android.os.Build
 import android.os.IBinder
@@ -16,6 +19,7 @@ import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * Foreground Service that plays alert.mp3 in a continuous loop.
@@ -48,11 +52,37 @@ class OrderAlertService : Service() {
         private const val EXTRA_ITEMS_JSON    = "items_json"
         private const val EXTRA_ITEM_COUNT    = "item_count"
 
-        /**
-         * Start the order alert service with full order details.
-         * Safe to call multiple times — duplicate starts are ignored by the
-         * isPlaying guard in startPlayback().
-         */
+        /** Mutable shared audio-state snapshot used only as a best-effort restore path when
+         *  OrderAlertService.stop(context) is called without a live instance (for example after the
+         *  service already exited in a racing stop path). This is intentionally a separate path from
+         *  the primary restore inside stopPlayback()/onDestroy(), which runs on the live instance. */
+        @Volatile
+        private var sharedPrevVolume: Int = 0
+        @Volatile
+        private var sharedStreamMax: Int = 0
+        @Volatile
+        private var sharedStreamType: Int = AudioManager.STREAM_ALARM
+
+        @JvmStatic
+        private fun restoreSharedStreamState(context: Context) {
+            if (sharedStreamType != AudioManager.STREAM_ALARM) return
+            if (sharedPrevVolume < 0) return
+            try {
+                val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+                val current = am.getStreamVolume(sharedStreamType)
+                if (current != sharedPrevVolume) {
+                    am.setStreamVolume(
+                        sharedStreamType,
+                        sharedPrevVolume,
+                        AudioManager.FLAG_SHOW_UI,
+                    )
+                }
+            } catch (_: Exception) {}
+        }
+
+        /** Start the order alert service with full order details.
+         *  Safe to call multiple times — duplicate starts are ignored by the
+         *  isPlaying guard in startPlayback(). */
         fun start(
             context: Context,
             orderId: String,
@@ -84,10 +114,8 @@ class OrderAlertService : Service() {
         @Volatile
         private var instance: OrderAlertService? = null
 
-        /**
-         * Stop the order alert service and release audio immediately.
-         * Safe to call multiple times from any thread or receiver.
-         */
+        /** Stop the order alert service and release audio immediately.
+         *  Safe to call multiple times from any thread or receiver. */
         fun stop(context: Context) {
             // Immediate in-memory stop for 0ms latency on ACCEPT/REJECT
             instance?.stopPlayback()
@@ -102,14 +130,28 @@ class OrderAlertService : Service() {
             try {
                 context.stopService(Intent(context, OrderAlertService::class.java))
             } catch (_: Exception) {}
+
+            // Best-effort cleanup for cases where stop() was called without a live instance
+            // (for example, duplicate-stop calls after the service already exited).
+            restoreSharedStreamState(context)
         }
 
-        /**
-         * Map raw FCM paymentMethod values to human-readable labels.
+        /** Set a snapshot of the current stream volume so stop(context) can restore it even
+         *  when called without a live instance. Called from startPlayback() on the live instance
+         *  right before the temporary bump so the snapshot reflects the real pre-alert level. */
+        private fun snapshotSharedStreamState(streamType: Int, prevVolume: Int, maxVolume: Int) {
+            sharedStreamType = streamType
+            sharedPrevVolume = prevVolume
+            sharedStreamMax = maxVolume
+        }
+
+        /** Map raw FCM paymentMethod values to human-readable labels.
          *   "cod"       -> "Cash on Delivery"
          *   "online"    -> "Online Payment"
          *   "upi"       -> "UPI"
-         */
+         *  Package-level accessible so NotificationHelperModule can call it as
+         *  OrderAlertService.friendlyPaymentMethod(...). */
+        @JvmStatic
         fun friendlyPaymentMethod(raw: String): String = when (raw.lowercase().trim()) {
             "cod"        -> "Cash on Delivery"
             "online"     -> "Online Payment"
@@ -130,9 +172,9 @@ class OrderAlertService : Service() {
          *   setSound(null)   → MediaPlayer handles audio via USAGE_ALARM (bypasses DND on most devices)
          *   vibration         → triple-buzz pattern for urgency
          *   VISIBILITY_PUBLIC → full detail on lock screen
-         */
-        /** Ensure the notification channel exists with the correct urgent configuration.
-         *  Safe to call multiple times — Android ignores duplicate channel creation. */
+         *  Package-level accessible so NotificationHelperModule can call it as
+         *  OrderAlertService.ensureNotificationChannel(...). */
+        @JvmStatic
         fun ensureNotificationChannel(context: Context) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 val nm = context.getSystemService(NotificationManager::class.java)
@@ -180,6 +222,20 @@ class OrderAlertService : Service() {
     @Volatile
     private var isPlaying = false
 
+    // Audio focus + temporary volume handling for urgent alert playback.
+    // We always play through the device's ALARM stream so the OS treats the order siren like an
+    // alarm: loud by default, mostly independent of the media volume slider, and eligible for DND
+    // bypass when the channel has it. If the device is at low alarm volume when the alert starts,
+    // the service temporarily raises the alarm stream to its current maximum for the active alert
+    // duration and then restores the previous level. We do NOT persist any change to the user's
+    // saved system volume settings and we do NOT disable the physical volume buttons.
+    private var audioManager: AudioManager? = null
+    private var audioFocusToken: Any? = null
+    private var audioFocusRequest: AudioFocusRequest? = null
+    private var previousStreamVolume = 0
+    private var streamMaxVolume = 0
+    private var alertStreamType = AudioManager.STREAM_ALARM
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     // ── Lifecycle ──
@@ -188,7 +244,7 @@ class OrderAlertService : Service() {
         super.onCreate()
         instance = this
         Log.d(TAG, "Service created")
-        createNotificationChannel()
+        ensureNotificationChannel(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -257,6 +313,8 @@ class OrderAlertService : Service() {
         // even after the service exits. JS task or NativeOrderApiService will
         // call cancelAll() on success.
         try { stopForeground(STOP_FOREGROUND_DETACH) } catch (_: Exception) {}
+        restoreStreamVolume()
+        releaseAudioFocus()
         super.onDestroy()
     }
 
@@ -279,8 +337,24 @@ class OrderAlertService : Service() {
                 if (resId == 0) {
                     Log.e(TAG, "alert.mp3 not found in res/raw — sound will be silent")
                     isPlaying = false
+                    releaseAudioFocus()
                     return
                 }
+
+                val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                audioManager = am
+                val streamType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    AudioManager.STREAM_ALARM
+                } else {
+                    AudioManager.STREAM_MUSIC
+                }
+                alertStreamType = streamType
+                previousStreamVolume = am.getStreamVolume(streamType)
+                streamMaxVolume = am.getStreamMaxVolume(streamType)
+
+                // Snapshot for the shared-state restore path used by stop(context) when
+                // there is no live instance left.
+                OrderAlertService.snapshotSharedStreamState(streamType, previousStreamVolume, streamMaxVolume)
 
                 val player = MediaPlayer()
                 mediaPlayer = player
@@ -293,6 +367,8 @@ class OrderAlertService : Service() {
                             .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                             .build()
                     )
+                    setVolume(1f, 1f)
+
                     setDataSource(
                         applicationContext,
                         android.net.Uri.parse("android.resource://$packageName/$resId"),
@@ -304,6 +380,15 @@ class OrderAlertService : Service() {
                             if (mediaPlayer == mp && this@OrderAlertService.isPlaying) {
                                 mp.start()
                                 Log.d(TAG, "[ORDER-ALERT] sound started (continuous loop of alert.mp3)")
+                                requestAudioFocus()
+                                bumpStreamVolume()
+                                // Refresh the per-player gain in case the stream volume was bumped after prepare.
+                                if (alertStreamType == AudioManager.STREAM_ALARM && streamMaxVolume > 0) {
+                                    mp.setVolume(
+                                        streamToGain(audioManager!!.getStreamVolume(alertStreamType), streamMaxVolume),
+                                        streamToGain(audioManager!!.getStreamVolume(alertStreamType), streamMaxVolume),
+                                    )
+                                }
                             } else {
                                 Log.d(TAG, "[ORDER-ALERT] player was cancelled before prepare completed")
                                 try { mp.release() } catch (_: Exception) {}
@@ -329,6 +414,7 @@ class OrderAlertService : Service() {
                 Log.e(TAG, "Failed to start alert playback", e)
                 mediaPlayer = null
                 this@OrderAlertService.isPlaying = false
+                releaseAudioFocus()
             }
         }
     }
@@ -338,7 +424,7 @@ class OrderAlertService : Service() {
      * Thread-safe and safe to call multiple times.
      */
     fun stopPlayback() {
-        synchronized(playbackLock) {
+        val token = synchronized(playbackLock) {
             isPlaying = false
             val player = mediaPlayer
             mediaPlayer = null // null FIRST so onPrepared or async listeners recognize cancellation
@@ -359,6 +445,16 @@ class OrderAlertService : Service() {
                 }
                 Log.d(TAG, "[ORDER-ALERT] Alert playback stopped and resources released")
             }
+
+            player
+        }
+
+        // Release audio focus and restore the stream to its pre-alert volume.
+        // Always run outside the lock so the slow stop/release path does not block the
+        // audio-state cleanup.
+        if (token != null) {
+            restoreStreamVolume()
+            releaseAudioFocus()
         }
     }
 
@@ -398,6 +494,8 @@ class OrderAlertService : Service() {
         val paymentLabel = friendlyPaymentMethod(paymentMethod)
 
         // ── PendingIntents ─────────────────────────────────────────────────────
+        // Use toInt() to ensure the request code is Int (avoids BigInteger widening on some SDKs).
+        fun requestCode(offset: Int): Int = (orderId.hashCode() or offset).toInt()
 
         val acceptIntent = Intent(this, NotificationActionReceiver::class.java).apply {
             action = NotificationHelperModule.ACTION_ACCEPT
@@ -406,7 +504,7 @@ class OrderAlertService : Service() {
         }
         val acceptPending = PendingIntent.getBroadcast(
             this,
-            orderId.hashCode() or 0x10000,
+            requestCode(0x10000),
             acceptIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
@@ -418,7 +516,7 @@ class OrderAlertService : Service() {
         }
         val rejectPending = PendingIntent.getBroadcast(
             this,
-            orderId.hashCode() or 0x20000,
+            requestCode(0x20000),
             rejectIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
@@ -429,14 +527,14 @@ class OrderAlertService : Service() {
         }
         val tapPending = PendingIntent.getActivity(
             this,
-            orderId.hashCode() or 0x30000,
+            requestCode(0x30000),
             tapIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         // Full-screen intent fires when device is locked / screen off.
         val fullScreenPending = PendingIntent.getActivity(
             this,
-            orderId.hashCode() or 0x40000,
+            requestCode(0x40000),
             tapIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
@@ -464,8 +562,8 @@ class OrderAlertService : Service() {
             }
             if (paymentMethod.isNotEmpty()) {
                 val statusText = if (paymentStatus.isNotEmpty() &&
-                    paymentStatus != "pending" &&
-                    paymentStatus != "cod") " (${paymentStatus.replaceFirstChar { it.uppercase() }})" else ""
+                        paymentStatus != "pending" &&
+                        paymentStatus != "cod") " (${paymentStatus.replaceFirstChar { it.uppercase() }})" else ""
                 append("Payment Method: $paymentLabel$statusText\n")
             }
             append("Items: $itemCountLabel\n")
@@ -542,6 +640,170 @@ class OrderAlertService : Service() {
 
     // ── Helpers ──
 
+    /** Temporary volume bump for the active order alert. Uses the current stream's max as
+     *  the temporary ceiling, then restores the previous level on stop. */
+    private fun bumpStreamVolume() {
+        if (alertStreamType == AudioManager.STREAM_ALARM) {
+            // On modern Android the alarm stream is already audible at its current level;
+            // we still raise it to the stream maximum for the duration of the alert so the
+            // siren is genuinely loud, then restore it below.
+            try {
+                audioManager?.setStreamVolume(
+                    alertStreamType,
+                    streamMaxVolume,
+                    AudioManager.FLAG_SHOW_UI,
+                )
+                Log.d(TAG, "[ORDER-ALERT] Bumped $alertStreamType volume to $streamMaxVolume")
+            } catch (e: SecurityException) {
+                Log.w(TAG, "Cannot temporarily raise stream volume: ${e.message}")
+            }
+        }
+        // On older devices we keep using STREAM_MUSIC at its current level; we do not
+        // force-boost it there because that stream is shared with media playback expectations
+        // and is more likely to be restricted. The USAGE_ALARM + audio focus path is the main
+        // loud-path mechanism on those devices.
+    }
+
+    private fun restoreStreamVolume() {
+        if (alertStreamType != AudioManager.STREAM_ALARM) return
+        if (previousStreamVolume < 0) return
+        val current = audioManager?.getStreamVolume(alertStreamType) ?: -1
+        if (current != previousStreamVolume) {
+            try {
+                audioManager?.setStreamVolume(
+                    alertStreamType,
+                    previousStreamVolume,
+                    AudioManager.FLAG_SHOW_UI,
+                )
+                Log.d(TAG, "[ORDER-ALERT] Restored $alertStreamType volume to $previousStreamVolume")
+            } catch (e: SecurityException) {
+                Log.w(TAG, "Cannot restore stream volume: ${e.message}")
+            }
+        } else {
+            Log.d(TAG, "[ORDER-ALERT] Stream volume already at $previousStreamVolume, skipping restore")
+        }
+    }
+
+    /** Convert a linear stream volume (0..max) to a MediaPlayer gain in [0.0, 1.0]. */
+    private fun streamToGain(current: Int, max: Int): Float {
+        if (max <= 0) return 1f
+        return (current.toFloat() / max.toFloat()).coerceIn(0f, 1f)
+    }
+
+    /** Request audio focus for an urgent, possibly long-running alarm-style playback. The focus
+     *  is held until the alert stops (ACCEPT / REJECT / service destroy). On platforms where a
+     *  FocusRequest can be registered, we use AudioManager.AUDIOFOCUS_GAIN for maximum loudness. */
+    private fun requestAudioFocus() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // Only register once per active alert.
+            if (audioFocusRequest != null) return
+            try {
+                val attrs = AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ALARM)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build()
+                audioFocusRequest = AudioFocusRequest.Builder(
+                    AudioManager.AUDIOFOCUS_GAIN,
+                ).setAudioAttributes(attrs)
+                    .setOnAudioFocusChangeListener(
+                        object : android.media.AudioManager.OnAudioFocusChangeListener {
+                            override fun onAudioFocusChange(focusChange: Int) {
+                                when (focusChange) {
+                                    AudioManager.AUDIOFOCUS_LOSS,
+                                    AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+                                    -> {
+                                        // Another app (or system) took focus — pause the siren so we do not fight it.
+                                        Log.w(TAG, "[ORDER-ALERT] Lost audio focus: $focusChange")
+                                        stopPlayback()
+                                    }
+                                    else -> {}
+                                }
+                            }
+                        },
+                    )
+                    .build()
+                val am = audioManager ?: return
+                val granted = am.requestAudioFocus(audioFocusRequest!!) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+                if (granted) {
+                    audioFocusToken = audioFocusRequest
+                    Log.d(TAG, "[ORDER-ALERT] Audio focus granted (AUDIOFOCUS_GAIN)")
+                } else {
+                    Log.w(TAG, "[ORDER-ALERT] Audio focus request not granted")
+                    audioFocusRequest = null
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "[ORDER-ALERT] Audio focus request failed: ${e.message}")
+                audioFocusRequest = null
+            }
+        } else {
+            // Legacy path: request focus directly without a FocusRequest.
+            val am = audioManager ?: return
+            val granted: Boolean = when {
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.M -> {
+                    am.requestAudioFocus(
+                        object : android.media.AudioManager.OnAudioFocusChangeListener {
+                            override fun onAudioFocusChange(focusChange: Int) {
+                                when (focusChange) {
+                                    AudioManager.AUDIOFOCUS_LOSS,
+                                    AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+                                    -> stopPlayback()
+                                    else -> {}
+                                }
+                            }
+                        },
+                        AudioManager.STREAM_MUSIC,
+                        AudioManager.AUDIOFOCUS_GAIN,
+                    ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+                }
+                else -> {
+                    am.requestAudioFocus(
+                        object : android.media.AudioManager.OnAudioFocusChangeListener {
+                            override fun onAudioFocusChange(focusChange: Int) {
+                                when (focusChange) {
+                                    AudioManager.AUDIOFOCUS_LOSS,
+                                    AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+                                    -> stopPlayback()
+                                    else -> {}
+                                }
+                            }
+                        },
+                        AudioManager.STREAM_MUSIC,
+                        AudioManager.AUDIOFOCUS_GAIN,
+                    ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+                }
+            }
+            if (granted) {
+                audioFocusToken = am
+                Log.d(TAG, "[ORDER-ALERT] Legacy audio focus granted (AUDIOFOCUS_GAIN)")
+            } else {
+                Log.w(TAG, "[ORDER-ALERT] Legacy audio focus request not granted")
+            }
+        }
+    }
+
+    private fun releaseAudioFocus() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val req = audioFocusRequest
+            if (req != null) {
+                try {
+                    (audioManager ?: return).abandonAudioFocusRequest(req)
+                } catch (_: Exception) {}
+                audioFocusRequest = null
+            }
+            audioFocusToken = null
+        } else if (audioFocusToken != null) {
+            try {
+                (audioFocusToken as? AudioManager)?.abandonAudioFocus(
+                    object : android.media.AudioManager.OnAudioFocusChangeListener {
+                        override fun onAudioFocusChange(focusChange: Int) {}
+                    },
+                )
+            } catch (_: Exception) {}
+            audioFocusToken = null
+        }
+        Log.d(TAG, "[ORDER-ALERT] Audio focus released")
+    }
+
     /** Structured item row parsed from the FCM items JSON array. */
     data class ItemRow(val name: String, val qty: Int, val lineTotal: Int)
 
@@ -580,4 +842,4 @@ class OrderAlertService : Service() {
             emptyList()
         }
     }
-}
+}
