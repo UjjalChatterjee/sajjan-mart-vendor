@@ -43,6 +43,7 @@ import {
 } from '@react-native-firebase/messaging';
 import type { RemoteMessage } from '@react-native-firebase/messaging';
 import { apiPost } from './api.client';
+import { syncApiBaseUrlToNative } from '../config/apiBaseUrl';
 import {
   claimNewOrderAlert,
   applyOrderDecision,
@@ -170,7 +171,6 @@ const NATIVE_MODULE = NativeModules.NotificationHelper as
       getTappedOrderId: () => Promise<string | null>;
     }
   | undefined;
-
 export const ORDER_CHANNEL_ID = 'sajjanmart_orders';
 const HEADLESS_TASK_NAME = 'NotificationActionTask';
 
@@ -391,6 +391,20 @@ async function runNotificationInit(userKey: string): Promise<void> {
     console.log('[FCM] Notification initialization started');
   }
 
+  // Publish the server address native code must call. This runs before anything
+  // else and outside the try/catch below: a killed-app ACCEPT / REJECT is
+  // handled entirely in Kotlin, and without this value it has no target — the
+  // exact bug that made every background tap fail with "No connection".
+  syncApiBaseUrlToNative();
+
+  // TEMPORARY FIELD DIAGNOSTIC — one line per session start telling us whether
+  // the installed APK even exposes the haptic. Delete with the other
+  // [ORDER-VIBE] logs once the two-phone test passes.
+  console.log(
+    `[ORDER-VIBE] bridge at init: module=${NATIVE_MODULE ? 'present' : 'MISSING'} ` +
+      `vibrateOrderAlert=${typeof NATIVE_MODULE?.vibrateOrderAlert}`,
+  );
+
   // Permission + token registration must never prevent the listeners below
   // from being registered (e.g. offline cold start).
   try {
@@ -540,7 +554,7 @@ export function routeOrderEventData(
 
   // Claimed exactly once per order, so this is one haptic per alert — a delivery
   // retry or a replayed buffer returns at the claim above.
-  vibrateForNewOrderAlert();
+  vibrateForNewOrderAlert(orderId);
 
   if (onIncomingOrder) {
     if (__DEV__) {
@@ -656,14 +670,37 @@ export function stopNativeOrderAlert(): void {
  * only for a claimed foreground push, which is the single JS vibration point:
  * a foreground alert posts no system notification (the modal is the UI), and
  * background / killed alerts vibrate through the notification channel instead.
+ *
+ * TEMPORARY FIELD DIAGNOSTICS ([ORDER-VIBE]): logged unconditionally, not just
+ * under __DEV__, so a release APK in the store tells us which hop dropped the
+ * buzz. The Kotlin side logs the device state (SDK, ringer mode, DND, channel
+ * config) under the same tag. Remove once the two-phone test passes.
  */
-function vibrateForNewOrderAlert(): void {
-  if (Platform.OS !== 'android' || !NATIVE_MODULE?.vibrateOrderAlert) return;
+function vibrateForNewOrderAlert(orderId: string): void {
+  if (Platform.OS !== 'android') {
+    console.log(`[ORDER-VIBE] SKIP order=${orderId} reason=not-android`);
+    return;
+  }
+  if (!NATIVE_MODULE) {
+    console.log(`[ORDER-VIBE] SKIP order=${orderId} reason=no-native-module`);
+    return;
+  }
+  if (typeof NATIVE_MODULE.vibrateOrderAlert !== 'function') {
+    console.log(
+      `[ORDER-VIBE] SKIP order=${orderId} reason=bridge-method-missing ` +
+        `(the installed APK has no vibrateOrderAlert — reinstall the new build)`,
+    );
+    return;
+  }
+
   try {
     NATIVE_MODULE.vibrateOrderAlert();
+    console.log(
+      `[ORDER-VIBE] JS dispatched order=${orderId} — look for the matching [ORDER-VIBE] line from Kotlin`,
+    );
   } catch (error) {
-    console.warn(
-      '[FCM] New-order haptic failed:',
+    console.log(
+      `[ORDER-VIBE] FAIL order=${orderId} bridge call threw:`,
       error instanceof Error ? error.message : String(error),
     );
   }
@@ -761,8 +798,14 @@ function startActionEventListener(): void {
 
 /**
  * Process a notification action (ACCEPT or REJECT).
- * Handles duplicate protection and notification dismissal.
+ * Handles duplicate protection and hands the action to the JS layer.
  * Called from both JS event listener and HeadlessJsTask.
+ *
+ * It deliberately does NOT dismiss anything. The alert belongs to the
+ * decision, not to the tap: applyOrderDecision() closes sound + notification +
+ * cache once the backend confirms it, and dismissStaleAlert() closes a 409. If
+ * the call fails — offline, expired session, server error — the alert stays in
+ * the shade as the retry point instead of vanishing on an unconfirmed decision.
  */
 export function processAction(
   action: 'ORDER_ACCEPT' | 'ORDER_REJECT',
@@ -779,12 +822,81 @@ export function processAction(
   }
   processedActions.add(key);
 
-  // Dismiss the notification
-  dismissNotification(orderId);
-
   // Notify the JS layer
   if (onNotificationAction) {
     onNotificationAction({ action, orderId });
+    return;
+  }
+
+  // No screen is mounted to own this tap (OrdersScreen unmounted, or the app
+  // was opened by the notification). Submitting here instead of only hiding the
+  // notification is the whole point: the old code dismissed the alert without
+  // ever calling the API, so the order stayed pending.
+  void settleNotificationAction(action, orderId).then(settled => {
+    if (!settled) {
+      // The decision never reached the backend, so the alert is still live and
+      // the admin may tap it again — release the dedupe claim for that retry.
+      processedActions.delete(key);
+    }
+  });
+}
+
+/**
+ * Submit an ACCEPT / REJECT decided from a notification when no screen owns it.
+ *
+ * Returns true when the backend settled the order (2xx, or 409 = decided
+ * elsewhere, which is equally final). false means the alert must stay recoverable.
+ *
+ * Cleanup mirrors the native path exactly:
+ *   2xx  → applyOrderDecision: stop sound, cancel this order's notification,
+ *          record it as decided, patch the ['orders'] cache. The other admin
+ *          devices clean themselves from the backend's ORDER_STATUS_UPDATED push.
+ *   409  → dismissStaleAlert: another device won the atomic pending-exit claim,
+ *          so this alert is stale rather than retryable.
+ *   else → log the real reason and touch nothing else. The siren was already
+ *          silenced by the receiver at the tap; the notification, with its
+ *          ACCEPT / REJECT buttons, is the retry point.
+ */
+export async function settleNotificationAction(
+  action: 'ORDER_ACCEPT' | 'ORDER_REJECT',
+  orderId: string,
+): Promise<boolean> {
+  const actionName = action === 'ORDER_ACCEPT' ? 'ACCEPT' : 'REJECT';
+
+  try {
+    // Imported lazily — order.service pulls in the API client and the store
+    // layer, and a static import here would close a cycle through the screens
+    // that register these handlers. This is also what makes the headless
+    // runtime work: no component, no App.tsx, no login screen required.
+    const { acceptOrder, rejectOrder } = require('../services/order.service') as {
+      acceptOrder(id: string): Promise<unknown>;
+      rejectOrder(id: string): Promise<unknown>;
+    };
+
+    if (action === 'ORDER_ACCEPT') {
+      await acceptOrder(orderId);
+    } else {
+      await rejectOrder(orderId);
+    }
+
+    console.log(`[ORDER-ACTION] ${actionName} order ${orderId} confirmed by server`);
+    applyOrderDecision(orderId, action === 'ORDER_ACCEPT' ? 'ACCEPTED' : 'REJECTED');
+    return true;
+  } catch (error) {
+    const status = (error as { status?: number } | null)?.status;
+    const message = error instanceof Error ? error.message : String(error);
+    console.log(
+      `[ORDER-ACTION] ${actionName} order ${orderId} NOT sent (status ${status ?? 'n/a'}): ${message}`,
+    );
+
+    if (status === 409) {
+      console.log(
+        `[ORDER-ACTION] Order ${orderId} was already decided on another device — dismissing stale alert`,
+      );
+      await dismissStaleAlert(orderId);
+      return true;
+    }
+    return false;
   }
 }
 
@@ -923,55 +1035,13 @@ export function registerHeadlessTask(): void {
         `[ORDER-ACTION] Headless task: ${actionName} for order ${orderId}`,
       );
 
-      try {
-        // Import the order service directly — no React component dependency.
-        // The API client reads the access token from AsyncStorage, which
-        // is available in the headless JS context.
-        const {
-          acceptOrder,
-          rejectOrder,
-        } = require('../services/order.service');
-
-        if (action === 'ORDER_ACCEPT') {
-          console.log(`[ORDER-ACTION] Calling acceptOrder(${orderId})`);
-          await acceptOrder(orderId);
-          console.log('[ORDER-ACTION] API success — order accepted');
-        } else if (action === 'ORDER_REJECT') {
-          console.log(`[ORDER-ACTION] Calling rejectOrder(${orderId})`);
-          await rejectOrder(orderId);
-          console.log('[ORDER-ACTION] API success — order rejected');
-        }
-
-        // SUCCESS: this device holds the decision — run the full cleanup
-        // (sound, notification, cache, decided-order tombstone) so a late
-        // NEW_ORDER replay for the same order can never ring again.
-        applyOrderDecision(
-          orderId,
-          action === 'ORDER_ACCEPT' ? 'ACCEPTED' : 'REJECTED',
-        );
-        console.log('[ORDER-ACTION] Notification dismissed');
-      } catch (error: any) {
-        // FAILURE: keep the notification visible so the user can see it
-        // and potentially retry by tapping the app.
-        const errorMsg = error?.message || String(error);
-        console.error(
-          `[ORDER-ACTION] API call failed for ${actionName} on order ${orderId}:`,
-          errorMsg,
-        );
-
-        // A 409 means another device already decided it — the alert is stale,
-        // not retryable. Dismiss it instead of keeping it up. The 409's own
-        // message is free text, not a status, so the live status is read from
-        // the order list; if that read fails the alert still closes.
-        if (error?.status === 409) {
-          console.log(
-            `[ORDER-ACTION] Order ${orderId} was already decided on another device — dismissing stale alert`,
-          );
-          await dismissStaleAlert(orderId);
-        }
-        // Do NOT dismiss the notification on any other failure — it stays
-        // visible as a persistent indicator that the action did not complete.
-      }
+      // Same single submit the no-screen branch of processAction uses: the API
+      // call reads the access token from AsyncStorage (available in the headless
+      // context), and cleanup / 409 / keep-the-alert rules cannot drift apart.
+      await settleNotificationAction(
+        action === 'ORDER_ACCEPT' ? 'ORDER_ACCEPT' : 'ORDER_REJECT',
+        orderId,
+      );
     };
   });
 }

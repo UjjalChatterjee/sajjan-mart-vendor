@@ -1,9 +1,10 @@
 package com.sajjanmart
 
-import android.app.NotificationManager
+import android.app.Notification
 import android.app.Service
-import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -25,15 +26,26 @@ import java.net.URLEncoder
  * running and we cannot rely on HeadlessJsTask cold boot being fast
  * or reliable enough for a time-sensitive order action.
  *
+ * Runs as a foreground service: the receiver that starts it may be the only
+ * thing keeping this process alive, and a plain background service start is
+ * restricted (and on Android 12+ throws) for a process revived by a tap.
+ *
  * Flow:
  *   NotificationActionReceiver
- *     → stop OrderAlertService   (looping sound + notification detach)
- *     → cancel notification      (remove from system tray immediately)
- *     → start NativeOrderApiService
+ *     → silence OrderAlertService (sound only; its notification STAYS)
+ *     → start NativeOrderApiService (foreground, "Sending…" entry)
  *         → read access token from AsyncStorage SQLite DB
- *         → PUT /api/orders/{orderId}  { "status": "confirmed" | "cancelled" }
- *         → on success: log
- *         → on failure: show informative feedback notification
+ *         → PUT {base}/api/orders/{orderId}  { "status": "confirmed" | "cancelled" }
+ *         → success / 409 : record the decision, cancel this order's notification,
+ *                           post a quiet outcome line
+ *         → any failure   : leave the order alert in place as the retry point,
+ *                           post the actual error, never mark the order resolved
+ *
+ * Base URL:
+ *   ApiBaseUrlStore — written by JS from Env.API_BASE_URL, the same address the
+ *   app itself uses. There are no loopback fallbacks any more: the previous
+ *   127.0.0.1 / 10.0.2.2 candidates could never reach the deployed backend, so
+ *   every killed-app tap failed with "No connection" and no order was decided.
  *
  * Token storage:
  *   @react-native-async-storage uses a Room-backed SQLite DB:
@@ -42,9 +54,11 @@ import java.net.URLEncoder
  *     Key col  : "key"      Value col : "value"
  *     Access token key : "@sajjanmart:accessToken"
  *
- * Base URL candidates (tried in order):
- *   1. http://127.0.0.1:3000  — physical device / local Metro server
- *   2. http://10.0.2.2:3000   — Android emulator loopback alias for host
+ * Auth contract (identical to src/services/api.client.ts):
+ *   Bearer header for the order call; refresh is POST /api/auth/refresh with
+ *   { "refreshToken": … } in the JSON body — the backend reads that body, or a
+ *   `refresh_token` cookie, and returns a new pair. Both tokens are stored,
+ *   because the backend rotates the refresh token too.
  */
 class NativeOrderApiService : Service() {
 
@@ -61,19 +75,32 @@ class NativeOrderApiService : Service() {
         private const val ACCESS_TOKEN_KEY  = "@sajjanmart:accessToken"
         private const val REFRESH_TOKEN_KEY = "@sajjanmart:refreshToken"
 
-        // API base URL candidates — tried in order
-        private val BASE_URL_CANDIDATES = listOf(
-            "http://127.0.0.1:3000",  // physical device / dev machine
-            "http://10.0.2.2:3000",   // Android emulator → host machine
-        )
-
         private const val CONNECT_TIMEOUT_MS  = 12_000
         private const val READ_TIMEOUT_MS     = 12_000
-        // Informational notification shown when the API call fails
-        private const val FEEDBACK_NOTIF_ID   = 0x4F524445
+
+        /**
+         * Taps of the same (action, order) that are already in flight. A double
+         * tap must produce one request, not two; the backend's atomic
+         * pending-exit claim answers 409 to the second one anyway, so this is
+         * about noise, not correctness. Cleared when the call settles, so a
+         * genuine retry after a failure is never blocked.
+         */
+        private val inFlight = mutableSetOf<String>()
+        private val inFlightLock = Any()
+
+        private fun tryClaim(key: String): Boolean = synchronized(inFlightLock) {
+            if (inFlight.contains(key)) false else { inFlight.add(key); true }
+        }
+
+        private fun release(key: String) {
+            synchronized(inFlightLock) { inFlight.remove(key) }
+        }
     }
 
     private enum class ApiResult { SUCCESS, AUTH_ERROR, SERVER_ERROR, NETWORK_ERROR, CONFLICT }
+
+    /** Set for the life of the running call so cleanup knows what it owns. */
+    private var claimedKey: String? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -104,115 +131,190 @@ class NativeOrderApiService : Service() {
             }
         }
 
+        val key = "$action:$orderId"
+        if (!tryClaim(key)) {
+            Log.d(TAG, "[ORDER-ACTION] $actionName for order $orderId already in flight — ignoring duplicate tap")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        claimedKey = key
+
         Log.d(TAG, "[ORDER-ACTION] $actionName for order $orderId (status → $newStatus)")
+
+        // An FGS must be foreground within seconds of the start, or the system
+        // kills the process — do it first, before any I/O.
+        if (!enterForeground(orderName(actionName), orderNumber ?: orderId)) {
+            release(key)
+            claimedKey = null
+            stopSelf()
+            return START_NOT_STICKY
+        }
 
         // All network work on a background thread — never block the main thread
         Thread {
             try {
-                val token = readTokenFromDb(ACCESS_TOKEN_KEY)
-                if (token == null) {
-                    Log.w(TAG, "[ORDER-ACTION] No access token — attempting token refresh")
-                    val refreshed = tryRefreshToken()
-                    if (refreshed == null) {
-                        Log.e(TAG, "[ORDER-ACTION] Token refresh failed — cannot call API")
-                        showFeedbackNotification(
-                            "Order Action Failed",
-                            "Not signed in. Open the app to $actionName order #$orderNumber manually.",
-                        )
-                    } else {
-                        executeApi(orderId, orderNumber ?: orderId, newStatus, actionName, refreshed)
-                    }
-                } else {
-                    executeApi(orderId, orderNumber ?: orderId, newStatus, actionName, token)
-                }
+                runDecision(orderId, orderNumber ?: orderId, newStatus, actionName)
             } catch (e: Exception) {
                 Log.e(TAG, "[ORDER-ACTION] Unexpected error: ${e.message}", e)
-                showFeedbackNotification(
-                    "Order Action Failed",
-                    "Unexpected error for order #$orderNumber. Open the app to retry.",
-                )
+                keepAlertForRetry(orderId, orderNumber ?: orderId, actionName, e.message ?: "unknown error")
+            } finally {
+                release(key)
+                claimedKey = null
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
             }
-            stopSelf()
         }.start()
 
         return START_NOT_STICKY
     }
 
-    // ── API execution ─────────────────────────────────────────────────────────
+    private fun orderName(actionName: String): String =
+        if (actionName == "ACCEPT") "Accepting" else "Rejecting"
 
-    private fun executeApi(
-        orderId: String,
-        orderNumber: String,
-        newStatus: String,
-        actionName: String,
-        token: String,
-    ) {
-        Log.d(TAG, "[ORDER-ACTION] Calling PUT /api/orders/$orderId status=$newStatus")
-        val encodedId = URLEncoder.encode(orderId, "UTF-8")
-        val bodyBytes = JSONObject().apply { put("status", newStatus) }.toString().toByteArray()
-
-        val result = callOrderApiWithFallback(encodedId, bodyBytes, token)
-
-        when (result) {
-            ApiResult.SUCCESS -> {
-                Log.d(TAG, "[ORDER-ACTION] ✓ $actionName order $orderId confirmed by server")
-                // Notification already cancelled by NotificationActionReceiver
-                // Remember the confirmed decision so a duplicate or late
-                // NEW_ORDER push for this order can never ring again.
-                OrderDecisionStore.markResolved(applicationContext, orderId)
-            }
-            ApiResult.CONFLICT -> {
-                // 409 — another device already moved this order out of pending.
-                // The backend kept the first decision; ours is stale.
-                Log.w(TAG, "[ORDER-ACTION] 409 — order $orderId already decided on another device")
-                OrderDecisionStore.markResolved(applicationContext, orderId)
-                showFeedbackNotification(
-                    "Order Already Handled",
-                    "Order #$orderNumber was already accepted or rejected on another device.",
+    /** Promote this service to foreground with a quiet "submitting" entry. */
+    private fun enterForeground(label: String, orderNumber: String): Boolean {
+        NativeOrderFeedback.ensureChannel(this)
+        val notification: Notification = NotificationCompat.Builder(this, NativeOrderFeedback.CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setContentTitle("$label order #$orderNumber")
+            .setContentText("Sending the decision to the server…")
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setOngoing(true)
+            .setSilent(true)
+            .build()
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(
+                    NativeOrderFeedback.ID_PROGRESS,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
                 )
+            } else {
+                startForeground(NativeOrderFeedback.ID_PROGRESS, notification)
             }
-            ApiResult.AUTH_ERROR -> {
-                // 401/403 — token may have just expired; try refresh and retry once
-                Log.w(TAG, "[ORDER-ACTION] Auth error (401/403) — refreshing token and retrying")
-                val newToken = tryRefreshToken()
-                if (newToken != null) {
-                    val retry = callOrderApiWithFallback(encodedId, bodyBytes, newToken)
-                    if (retry == ApiResult.SUCCESS) {
-                        Log.d(TAG, "[ORDER-ACTION] ✓ $actionName order $orderId — retry succeeded")
-                        OrderDecisionStore.markResolved(applicationContext, orderId)
-                        return
-                    }
-                    if (retry == ApiResult.CONFLICT) {
-                        Log.w(TAG, "[ORDER-ACTION] 409 on retry — order $orderId already decided")
-                        OrderDecisionStore.markResolved(applicationContext, orderId)
-                        showFeedbackNotification(
-                            "Order Already Handled",
-                            "Order #$orderNumber was already accepted or rejected on another device.",
-                        )
-                        return
-                    }
-                }
-                showFeedbackNotification(
-                    "Order Action Failed — Auth Error",
-                    "Session expired. Open the app to $actionName order #$orderNumber.",
-                )
-            }
-            ApiResult.NETWORK_ERROR -> {
-                showFeedbackNotification(
-                    "Order Action Failed — No Connection",
-                    "Could not reach server. Open the app to $actionName order #$orderNumber.",
-                )
-            }
-            else -> {
-                showFeedbackNotification(
-                    "Order Action Failed",
-                    "Server error. Open the app to $actionName order #$orderNumber manually.",
-                )
-            }
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "[ORDER-ACTION] Could not enter foreground: ${e.message}", e)
+            NativeOrderFeedback.show(
+                this,
+                NativeOrderFeedback.ID_RESULT,
+                "Order Action Not Sent",
+                "The app could not submit order #$orderNumber in the background. " +
+                    "Open the app to $label it.",
+                orderId = null,
+            )
+            false
         }
     }
 
+    // ── Decision ──────────────────────────────────────────────────────────────
+
+    private fun runDecision(orderId: String, orderNumber: String, newStatus: String, actionName: String) {
+        val baseUrl = ApiBaseUrlStore.read(this)
+        if (baseUrl == null) {
+            Log.e(TAG, "[ORDER-ACTION] No API base URL stored — open the app once so JS can publish Env.API_BASE_URL")
+            keepAlertForRetry(orderId, orderNumber, actionName, "no server address stored (open the app once)")
+            return
+        }
+        Log.d(TAG, "[ORDER-ACTION] Using API base URL $baseUrl")
+
+        val token = readTokenFromDb(ACCESS_TOKEN_KEY) ?: tryRefreshToken(baseUrl)
+        if (token == null) {
+            Log.e(TAG, "[ORDER-ACTION] No usable access token — refresh failed")
+            keepAlertForRetry(orderId, orderNumber, actionName, "session expired and the token refresh failed")
+            return
+        }
+
+        val encodedId = URLEncoder.encode(orderId, "UTF-8")
+        val bodyBytes = JSONObject().apply { put("status", newStatus) }.toString().toByteArray()
+
+        when (callOrderApi(baseUrl, encodedId, bodyBytes, token)) {
+            ApiResult.SUCCESS -> confirmDecision(orderId, orderNumber, actionName)
+            ApiResult.CONFLICT -> staleDecision(orderId, orderNumber)
+            ApiResult.AUTH_ERROR -> {
+                // The stored token was rejected outright: renew once and retry.
+                Log.w(TAG, "[ORDER-ACTION] Auth error (401/403) — refreshing token and retrying")
+                val fresh = tryRefreshToken(baseUrl)
+                if (fresh == null) {
+                    keepAlertForRetry(orderId, orderNumber, actionName, "session expired and the token refresh failed")
+                    return
+                }
+                when (callOrderApi(baseUrl, encodedId, bodyBytes, fresh)) {
+                    ApiResult.SUCCESS  -> confirmDecision(orderId, orderNumber, actionName)
+                    ApiResult.CONFLICT -> staleDecision(orderId, orderNumber)
+                    ApiResult.AUTH_ERROR -> keepAlertForRetry(
+                        orderId, orderNumber, actionName, "the server kept rejecting the session (401/403)",
+                    )
+                    ApiResult.NETWORK_ERROR -> keepAlertForRetry(
+                        orderId, orderNumber, actionName, "could not reach $baseUrl",
+                    )
+                    else -> keepAlertForRetry(
+                        orderId, orderNumber, actionName, "server error after a token refresh",
+                    )
+                }
+            }
+            ApiResult.NETWORK_ERROR ->
+                keepAlertForRetry(orderId, orderNumber, actionName, "could not reach $baseUrl")
+            ApiResult.SERVER_ERROR ->
+                keepAlertForRetry(orderId, orderNumber, actionName, "the server rejected the change (see logcat)")
+        }
+    }
+
+    /** The backend took the decision: this device's alert is finished. */
+    private fun confirmDecision(orderId: String, orderNumber: String, actionName: String) {
+        Log.d(TAG, "[ORDER-ACTION] ✓ $actionName order $orderId confirmed by server")
+        OrderDecisionStore.markResolved(applicationContext, orderId)
+        // The only place the order notification is cancelled — after success.
+        // The other admin devices get the same cleanup from the backend's
+        // ORDER_STATUS_UPDATED push (CustomMessagingReceiver handles it natively).
+        OrderAlertService.handleOrderResolved(applicationContext, orderId)
+        NativeOrderFeedback.show(
+            applicationContext,
+            NativeOrderFeedback.ID_RESULT,
+            if (actionName == "ACCEPT") "Order Accepted" else "Order Rejected",
+            "Order #$orderNumber ${if (actionName == "ACCEPT") "accepted" else "rejected"} — confirmed by the server.",
+            orderId = orderId,
+        )
+    }
+
+    /** 409 — another device settled it first, so this alert is stale, not retryable. */
+    private fun staleDecision(orderId: String, orderNumber: String) {
+        Log.w(TAG, "[ORDER-ACTION] 409 — order $orderId already decided on another device")
+        OrderDecisionStore.markResolved(applicationContext, orderId)
+        OrderAlertService.handleOrderResolved(applicationContext, orderId)
+        NativeOrderFeedback.show(
+            applicationContext,
+            NativeOrderFeedback.ID_RESULT,
+            "Order Already Handled",
+            "Order #$orderNumber was already accepted or rejected on another device.",
+            orderId = orderId,
+        )
+    }
+
+    /**
+     * The decision did not reach the backend.
+     *
+     * The order alert notification is deliberately NOT cancelled: it still
+     * carries working ACCEPT / REJECT buttons and the tap-to-open intent, so the
+     * alert is recoverable rather than silently dismissed. The order is NOT
+     * recorded as resolved either, so its NEW_ORDER alert can never be muted on
+     * the strength of a call that failed.
+     */
+    private fun keepAlertForRetry(orderId: String, orderNumber: String, actionName: String, reason: String) {
+        Log.e(TAG, "[ORDER-ACTION] ✗ $actionName order $orderId NOT sent — $reason")
+        NativeOrderFeedback.show(
+            applicationContext,
+            NativeOrderFeedback.ID_RESULT,
+            "Order Action Failed — Tap to Retry",
+            "$actionName for order #$orderNumber was NOT sent ($reason). " +
+                "The order alert is still in the shade — tap it to open the app and decide again.",
+            orderId = orderId,
+        )
+    }
+
     // ── SQLite token helpers ──────────────────────────────────────────────────
+
+    // ── Token storage ─────────────────────────────────────────────────────────
 
     /**
      * Read any value from the AsyncStorage SQLite database.
@@ -283,71 +385,72 @@ class NativeOrderApiService : Service() {
     // ── Token refresh ─────────────────────────────────────────────────────────
 
     /**
-     * Attempt a token refresh via POST /api/auth/refresh.
-     * Sends the stored refresh token as a Cookie header, matching the JS api.client.ts logic.
-     * Persists the new access token to AsyncStorage on success.
+     * POST {base}/api/auth/refresh with { "refreshToken": … } in the JSON body —
+     * the exact contract src/services/api.client.ts uses.
+     *
+     * This used to send `Cookie: refreshToken=…` with an empty body. The backend
+     * reads the body or a `refresh_token` cookie (never `refreshToken`), so every
+     * native refresh answered 401 "Refresh token missing" and a killed app with an
+     * expired 15-minute access token could never decide an order.
+     *
+     * Persists BOTH tokens: the backend rotates the refresh token as well, and
+     * keeping only the access token would strand the next refresh on a stale one.
+     * Never logs a token value.
      */
-    private fun tryRefreshToken(): String? {
+    private fun tryRefreshToken(baseUrl: String): String? {
         val refreshToken = readTokenFromDb(REFRESH_TOKEN_KEY) ?: return null
-        for (baseUrl in BASE_URL_CANDIDATES) {
+        return try {
+            val conn = URL("$baseUrl/api/auth/refresh").openConnection() as HttpURLConnection
             try {
-                val url  = URL("$baseUrl/api/auth/refresh")
-                val conn = url.openConnection() as HttpURLConnection
-                try {
-                    conn.requestMethod = "POST"
-                    conn.setRequestProperty("Content-Type", "application/json")
-                    conn.setRequestProperty("Cookie", "refreshToken=$refreshToken")
-                    conn.connectTimeout = CONNECT_TIMEOUT_MS
-                    conn.readTimeout    = READ_TIMEOUT_MS
-                    conn.doOutput = true
-                    conn.outputStream.use { it.write("{}".toByteArray()) }
-
-                    val code = conn.responseCode
-                    if (code in 200..299) {
-                        val body = conn.inputStream.bufferedReader().readText()
-                        val json = JSONObject(body)
-                        val newToken = json.optString("accessToken").takeIf { it.isNotEmpty() }
-                            ?: json.optString("token").takeIf { it.isNotEmpty() }
-                        if (newToken != null) {
-                            Log.d(TAG, "[ORDER-ACTION] Token refresh succeeded via $baseUrl")
-                            persistTokenToDb(ACCESS_TOKEN_KEY, newToken)
-                            return newToken
-                        }
-                    } else {
-                        Log.w(TAG, "[ORDER-ACTION] Refresh HTTP $code from $baseUrl")
-                    }
-                } finally {
-                    conn.disconnect()
+                conn.requestMethod = "POST"
+                conn.setRequestProperty("Content-Type", "application/json")
+                conn.setRequestProperty("Accept", "application/json")
+                conn.connectTimeout = CONNECT_TIMEOUT_MS
+                conn.readTimeout    = READ_TIMEOUT_MS
+                conn.doOutput = true
+                conn.outputStream.use {
+                    it.write(JSONObject().apply { put("refreshToken", refreshToken) }.toString().toByteArray())
                 }
-            } catch (e: ConnectException) {
-                Log.w(TAG, "[ORDER-ACTION] Refresh: connect failed to $baseUrl")
-            } catch (e: Exception) {
-                Log.w(TAG, "[ORDER-ACTION] Refresh error ($baseUrl): ${e.message}")
+
+                val code = conn.responseCode
+                if (code !in 200..299) {
+                    Log.e(TAG, "[ORDER-ACTION] Refresh HTTP $code from $baseUrl")
+                    return null
+                }
+                val json = JSONObject(conn.inputStream.bufferedReader().readText())
+                val newAccessToken = json.optString("accessToken")
+                    .takeIf { it.isNotEmpty() }
+                    ?: json.optString("token").takeIf { it.isNotEmpty() }
+                if (newAccessToken == null) {
+                    Log.e(TAG, "[ORDER-ACTION] Refresh response carried no access token")
+                    return null
+                }
+                Log.d(TAG, "[ORDER-ACTION] Token refresh succeeded via $baseUrl")
+                persistTokenToDb(ACCESS_TOKEN_KEY, newAccessToken)
+                json.optString("refreshToken").takeIf { it.isNotEmpty() }?.let {
+                    persistTokenToDb(REFRESH_TOKEN_KEY, it)
+                }
+                newAccessToken
+            } finally {
+                conn.disconnect()
             }
+        } catch (e: ConnectException) {
+            Log.e(TAG, "[ORDER-ACTION] Refresh: connect failed to $baseUrl")
+            null
+        } catch (e: Exception) {
+            Log.e(TAG, "[ORDER-ACTION] Refresh error ($baseUrl): ${e.message}")
+            null
         }
-        return null
     }
 
     // ── HTTP helpers ──────────────────────────────────────────────────────────
 
     /**
-     * Call PUT /api/orders/{encodedId} trying each base URL candidate.
-     * Returns SUCCESS on 2xx, AUTH_ERROR on 401/403, SERVER_ERROR on other 4xx/5xx,
-     * NETWORK_ERROR when no URL could be reached at all.
+     * Call PUT {base}/api/orders/{encodedId}.
+     * SUCCESS on 2xx, AUTH_ERROR on 401/403, CONFLICT on 409 (another device
+     * decided first), SERVER_ERROR on any other answer, NETWORK_ERROR when the
+     * server could not be reached at all.
      */
-    private fun callOrderApiWithFallback(
-        encodedId: String,
-        bodyBytes: ByteArray,
-        token: String,
-    ): ApiResult {
-        for (baseUrl in BASE_URL_CANDIDATES) {
-            val result = callOrderApi(baseUrl, encodedId, bodyBytes, token)
-            if (result != ApiResult.NETWORK_ERROR) return result
-            Log.w(TAG, "[ORDER-ACTION] $baseUrl unreachable, trying next candidate")
-        }
-        return ApiResult.NETWORK_ERROR
-    }
-
     private fun callOrderApi(
         baseUrl: String,
         encodedId: String,
@@ -397,32 +500,6 @@ class NativeOrderApiService : Service() {
         } catch (e: Exception) {
             Log.e(TAG, "[ORDER-ACTION] HTTP error ($baseUrl): ${e.message}")
             ApiResult.NETWORK_ERROR
-        }
-    }
-
-    // ── Feedback notification ─────────────────────────────────────────────────
-
-    /**
-     * Show a small, auto-cancelling informational notification so the admin
-     * knows the background API call failed and needs manual attention.
-     * Uses the existing orders notification channel — no new channel needed.
-     */
-    private fun showFeedbackNotification(title: String, text: String) {
-        try {
-            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            val notification = NotificationCompat.Builder(this, NotificationHelperModule.CHANNEL_ID)
-                .setSmallIcon(android.R.drawable.ic_dialog_alert)
-                .setContentTitle(title)
-                .setContentText(text)
-                .setStyle(NotificationCompat.BigTextStyle().bigText(text))
-                .setPriority(NotificationCompat.PRIORITY_DEFAULT)
-                .setAutoCancel(true)
-                .setOngoing(false)
-                .build()
-            nm.notify(FEEDBACK_NOTIF_ID, notification)
-            Log.d(TAG, "[ORDER-ACTION] Feedback notification shown: $title")
-        } catch (e: Exception) {
-            Log.e(TAG, "[ORDER-ACTION] Could not show feedback notification: ${e.message}")
         }
     }
 }

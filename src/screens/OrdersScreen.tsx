@@ -384,16 +384,26 @@ export function OrdersScreen() {
   // Register notification action handler (ACCEPT/REJECT from notification buttons)
   useEffect(() => {
     setNotificationActionHandler(async ({ action, orderId }) => {
+      const outcome = action === 'ORDER_ACCEPT' ? 'ACCEPTED' : 'REJECTED';
+      console.log(`[ORDER-ACTION] ${outcome} from notification`);
       try {
-        const outcome = action === 'ORDER_ACCEPT' ? 'ACCEPTED' : 'REJECTED';
-        console.log(`[ORDER-ACTION] ${outcome} from notification`);
         await settleDecision(orderId, outcome);
-      } catch {
-        // Notification actions are fire-and-forget; errors are non-critical
+      } catch (err) {
+        // The decision never reached the backend. settleDecision already closed
+        // the alert for 2xx and for a 409; anything else (offline, expired
+        // session, server error) must leave the alert in place as the retry
+        // point, and say why — never a silent swallow.
+        const message = err instanceof Error ? err.message : String(err);
+        console.log(
+          `[ORDER-ACTION] ${outcome} for order ${orderId} NOT sent: ${message}`,
+        );
+        showError(
+          `Could not ${outcome === 'ACCEPTED' ? 'accept' : 'reject'} order ${orderId}: ${message}`,
+        );
       }
     });
     return () => removeNotificationActionHandler();
-  }, [settleDecision]);
+  }, [settleDecision, showError]);
 
 
   // Pull-to-refresh via TanStack Query

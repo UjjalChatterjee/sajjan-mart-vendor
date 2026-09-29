@@ -10,6 +10,7 @@ import android.media.AudioManager
 import android.media.MediaPlayer
 import android.os.Build
 import android.os.VibrationEffect
+import android.os.VibrationAttributes
 import android.os.Vibrator
 import android.os.VibratorManager
 import android.util.Log
@@ -96,6 +97,18 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
         fun notificationIdFor(orderId: String): Int {
             return 0x7FFFFFFF and orderId.hashCode()
         }
+
+        /**
+         * PendingIntent request code for one order's ACCEPT / REJECT button.
+         *
+         * Mixing with multiplication, not `or`: `orderId.hashCode() or 0x10000`
+         * left two orders whose hashes differed only inside those bits with the
+         * SAME code, and with FLAG_UPDATE_CURRENT the second notification
+         * silently rewrote the first button's target order.
+         */
+        @JvmStatic
+        fun actionRequestCode(orderId: String, action: String): Int =
+            0x7FFFFFFF and (31 * orderId.hashCode() + if (action == ACTION_REJECT) 7919 else 104729)
     }
 
     init {
@@ -273,32 +286,130 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
      * foreground no system notification is posted (the modal IS the UI), so the
      * channel-level vibration never runs — this is the only vibration source for
      * that path, which keeps exactly one buzz per alert.
+     *
+     * The burst always carries an *alarm* usage: VibrationAttributes on API 31+,
+     * AudioAttributes on API 26–30. A bare Vibrator.vibrate(effect) runs with
+     * *notification* usage, which the platform and OEM skins (MIUI and friends)
+     * drop whenever the ringtone is silent or Do Not Disturb is on — an order
+     * alert must not be silenced by that. Never gated by the sound
+     * preference: a muted alert is a silent alert, not an invisible one.
+     *
+     * [ORDER-VIBE] logs are the field diagnostic for "the popup appeared but the
+     * phone never buzzed" — they name the state of every hop.
      */
     @ReactMethod
     fun vibrateOrderAlert() {
         val ctx = reactApplicationContext
-        val vibrator: Vibrator? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            (ctx.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager)
-                ?.defaultVibrator
-        } else {
-            ctx.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+        val sdk = Build.VERSION.SDK_INT
+        val manager = ctx.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
+        val vibrator: Vibrator? = manager?.defaultVibrator
+            ?: ctx.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+
+        val nm = ctx.getSystemService(NotificationManager::class.java)
+        val am = ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        val ringerMode = when (am?.ringerMode) {
+            AudioManager.RINGER_MODE_NORMAL -> "normal"
+            AudioManager.RINGER_MODE_VIBRATE -> "vibrate"
+            AudioManager.RINGER_MODE_SILENT -> "silent"
+            else -> "unknown(${am?.ringerMode})"
         }
+        Log.i(
+            TAG,
+            "[ORDER-VIBE] request sdk=$sdk hasVibrator=${vibrator?.hasVibrator() == true} " +
+                "ringerMode=$ringerMode interruptionFilter=${nm.currentInterruptionFilter} " +
+                "dndPolicyAccess=${nm.isNotificationPolicyAccessGranted} " +
+                "channelVibrates=${channelVibrationState(ctx)}",
+        )
 
         if (vibrator == null || !vibrator.hasVibrator()) {
-            Log.d(TAG, "[ORDER-ALERT] No vibrator on this device — haptic skipped")
+            Log.e(TAG, "[ORDER-VIBE] STOPPED HERE — no vibrator handle for sdk=$sdk")
+            return
+        }
+        val motor: Vibrator = vibrator
+
+        val effect = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            VibrationEffect.createWaveform(ORDER_ALERT_VIBRATION_PATTERN, -1)
+        } else {
+            null
+        }
+
+        try {
+            if (sdk >= Build.VERSION_CODES.S && effect != null) {
+                motor.vibrate(
+                    effect,
+                    VibrationAttributes.createForUsage(VibrationAttributes.USAGE_ALARM),
+                )
+                Log.i(TAG, "[ORDER-VIBE] dispatched with VibrationAttributes USAGE_ALARM")
+            } else if (effect != null) {
+                // API 26–30 (the field device is 29): the bare vibrate(effect) runs
+                // as a *notification*, which MIUI and AOSP both drop when the
+                // ringer is silent. This overload carries the alarm usage instead.
+                motor.vibrate(
+                    effect,
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ALARM)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build(),
+                )
+                Log.i(TAG, "[ORDER-VIBE] dispatched with AudioAttributes USAGE_ALARM")
+            } else {
+                // API 24/25 has no VibrationEffect; the waveform overload there is the
+                // only way to reuse the shared pattern.
+                motor.vibrate(ORDER_ALERT_VIBRATION_PATTERN, -1)
+                Log.i(TAG, "[ORDER-VIBE] dispatched via legacy waveform")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "[ORDER-VIBE] STOPPED HERE — vibrate() threw: ${e.message}", e)
             return
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            vibrator.vibrate(
-                VibrationEffect.createWaveform(ORDER_ALERT_VIBRATION_PATTERN, -1),
+        // The motor state is not queryable on current SDKs (Vibrator.isVibrating()
+        // was removed), so this second line is the post-dispatch environment sample:
+        // separating "we never asked" (no dispatch line at all) from "we asked and
+        // the OS/OEM dropped it" (dispatch line, then a silent ringer here).
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            Log.i(
+                TAG,
+                "[ORDER-VIBE] 250ms after dispatch ringerMode=$ringerMode " +
+                    "interruptionFilter=${nm.currentInterruptionFilter} " +
+                    "channelVibrates=${channelVibrationState(ctx)}",
             )
-        } else {
-            // API 24/25 has no VibrationEffect; the waveform overload there is the
-            // only way to reuse the shared pattern.
-            vibrator.vibrate(ORDER_ALERT_VIBRATION_PATTERN, -1)
-        }
-        Log.d(TAG, "[ORDER-ALERT] New-order haptic fired")
+        }, 250)
+    }
+
+    /** Whether the order-alert channel is still configured to vibrate — a channel
+     *  created by an older build keeps its pattern across installs, so this is
+     *  logged rather than assumed. */
+    private fun channelVibrationState(context: Context): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return "n/a(pre-O)"
+        val channel = context.getSystemService(NotificationManager::class.java)
+            .getNotificationChannel(CHANNEL_ID) ?: return "missing"
+        return "enabled=${channel.shouldVibrate()} pattern=${channel.vibrationPattern?.joinToString()}"
+    }
+
+    /* ── API base URL (native-only paths) ── */
+
+    /**
+     * JS call: NotificationHelper.setApiBaseUrl(Env.API_BASE_URL)
+     *
+     * Publishes the address the JS runtime is using into SharedPreferences so the
+     * killed-app ACCEPT / REJECT path (NativeOrderApiService, which runs with no
+     * JS bundle) calls the same server. One store, same rule as the sound switch:
+     * Kotlin holds no URL of its own.
+     */
+    @ReactMethod
+    fun setApiBaseUrl(url: String?) {
+        ApiBaseUrlStore.save(reactApplicationContext, url)
+    }
+
+    /**
+     * JS call: NotificationHelper.getApiBaseUrl() → Promise<String | null>
+     *
+     * Diagnostic read: what the native-only paths will actually call.
+     */
+    @ReactMethod
+    fun getApiBaseUrl(promise: Promise) {
+        promise.resolve(ApiBaseUrlStore.read(reactApplicationContext))
     }
 
     /**
@@ -551,23 +662,45 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
     /* ── Emit action to JS ── */
 
     /**
+     * True only when a JS runtime is alive RIGHT NOW and can receive an event.
+     *
+     * The receiver must not trust `instance != null`: that only says the module
+     * was constructed once, which stays true after the React host has been torn
+     * down (or while it never came up in a process revived by a notification
+     * tap). Trusting it dropped ACCEPT / REJECT taps with no native fallback.
+     */
+    fun canEmitToJS(): Boolean =
+        try {
+            reactApplicationContext.hasActiveReactInstance()
+        } catch (e: Exception) {
+            false
+        }
+
+    /**
      * Called by NotificationActionReceiver when the app is alive.
      * Emits a "NotificationAction" event to JS.
+     *
+     * Returns false when nothing was emitted, so the caller can fall back to the
+     * native API service instead of losing the tap.
      */
-    fun emitActionToJS(action: String, orderId: String) {
+    fun emitActionToJS(action: String, orderId: String): Boolean {
         try {
-            if (reactApplicationContext.hasActiveReactInstance()) {
-                Log.d(TAG, "[ORDER-ACTION] Emitting to JS: $action for order $orderId")
-                val params = com.facebook.react.bridge.Arguments.createMap().apply {
-                    putString("action", action)
-                    putString("orderId", orderId)
-                }
-                reactApplicationContext
-                    .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
-                    .emit("NotificationAction", params)
+            if (!reactApplicationContext.hasActiveReactInstance()) {
+                Log.w(TAG, "[ORDER-ACTION] No active JS runtime — action not emitted")
+                return false
             }
+            Log.d(TAG, "[ORDER-ACTION] Emitting to JS: $action for order $orderId")
+            val params = com.facebook.react.bridge.Arguments.createMap().apply {
+                putString("action", action)
+                putString("orderId", orderId)
+            }
+            reactApplicationContext
+                .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+                .emit("NotificationAction", params)
+            return true
         } catch (e: Exception) {
             Log.w(TAG, "Could not emit action to JS: ${e.message}")
+            return false
         }
     }
 
@@ -617,8 +750,8 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
             putExtra(EXTRA_ACTION, action)
             putExtra("orderNumber", orderNumber)
         }
-        // Use orderId hashCode as request code so each notification gets unique PendingIntents
-        val requestCode = orderId.hashCode() or (if (action == ACTION_ACCEPT) 0x10000 else 0x20000)
+        // Unique per (order, action) — see actionRequestCode.
+        val requestCode = actionRequestCode(orderId, action)
         return PendingIntent.getBroadcast(
             ctx, requestCode, intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,

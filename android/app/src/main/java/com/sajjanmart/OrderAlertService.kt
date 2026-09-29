@@ -173,6 +173,39 @@ class OrderAlertService : Service() {
             }
         }
 
+        /**
+         * Silence the siren for an order WITHOUT cancelling its notification.
+         *
+         * Used the instant a notification action button is tapped: the loop must
+         * stop on the fingertip, but the order has not been decided yet. If the
+         * backend call then fails, the notification (with its working ACCEPT /
+         * REJECT buttons) is still in the tray, so the alert stays recoverable
+         * instead of vanishing on an unconfirmed decision.
+         *
+         * Only the order that owns the live alert can silence it — another
+         * pending order keeps ringing.
+         */
+        @JvmStatic
+        fun stopSoundKeepNotification(context: Context, orderId: String) {
+            if (orderId.isBlank() || orderId == "unknown") return
+            if (activeOrderId != orderId) {
+                Log.d(TAG, "[ORDER-ALERT] Order $orderId does not own the siren — sound left running")
+                return
+            }
+
+            instance?.stopPlayback()
+            activeOrderId = null
+            // stopService → onDestroy → stopForeground(DETACH): the looping audio
+            // and the foreground-service state end, the notification survives.
+            try {
+                context.stopService(Intent(context, OrderAlertService::class.java))
+            } catch (e: Exception) {
+                Log.w(TAG, "[ORDER-ALERT] Could not stop the service cleanly: ${e.message}")
+            }
+            restoreSharedStreamState(context)
+            Log.d(TAG, "[ORDER-ALERT] Siren silenced for $orderId, notification kept")
+        }
+
         /** Stop the order alert service and release audio immediately.
          *  Safe to call multiple times from any thread or receiver. */
         @JvmStatic
@@ -241,8 +274,10 @@ class OrderAlertService : Service() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 val nm = context.getSystemService(NotificationManager::class.java)
                 val channelId = NotificationHelperModule.CHANNEL_ID
+                val pattern = NotificationHelperModule.ORDER_ALERT_VIBRATION_PATTERN
 
-                if (nm.getNotificationChannel(channelId) == null) {
+                val existing = nm.getNotificationChannel(channelId)
+                if (existing == null) {
                     val channel = NotificationChannel(
                         channelId,
                         NotificationHelperModule.CHANNEL_NAME,
@@ -252,7 +287,7 @@ class OrderAlertService : Service() {
                         enableVibration(true)
                         // Shared pattern — the in-app alert vibrates with this same
                         // array, so every new-order alert buzzes identically.
-                        vibrationPattern = NotificationHelperModule.ORDER_ALERT_VIBRATION_PATTERN
+                        vibrationPattern = pattern
                         enableLights(true)
                         lightColor = 0xFF16A34A.toInt()
                         lockscreenVisibility = Notification.VISIBILITY_PUBLIC
@@ -264,6 +299,28 @@ class OrderAlertService : Service() {
                     }
                     nm.createNotificationChannel(channel)
                     Log.d(TAG, "[ORDER-ALERT] Notification channel created: $channelId")
+                } else if (channelNeedsVibrationRepair(existing, pattern)) {
+                    // A channel installed by an older build keeps its stored config
+                    // forever — importance included, which is why the create branch
+                    // above only runs once. Vibration is app-writable though, so a
+                    // channel that lost the pattern (or had vibration switched off)
+                    // is repaired here instead of silently muting every
+                    // background/killed order alert.
+                    Log.w(
+                        TAG,
+                        "[ORDER-VIBE] channel ${existing.id} needed repair: " +
+                            "vibrates=${existing.shouldVibrate()} " +
+                            "pattern=${existing.vibrationPattern?.joinToString()}",
+                    )
+                    existing.enableVibration(true)
+                    existing.vibrationPattern = pattern
+                    nm.createNotificationChannel(existing)
+                } else {
+                    Log.d(
+                        TAG,
+                        "[ORDER-VIBE] channel ${existing.id} vibrates=${existing.shouldVibrate()} " +
+                            "pattern=${existing.vibrationPattern?.joinToString()}",
+                    )
                 }
 
                 // Log DND bypass status so we know if bypass is actually active.
@@ -276,6 +333,15 @@ class OrderAlertService : Service() {
                     Log.d(TAG, "[ORDER-ALERT] Bypass DND requested but depends on user grant in Settings > Notifications > Do Not Disturb")
                 }
             }
+        }
+
+        /** True when the stored channel would not buzz with the shared pattern. */
+        private fun channelNeedsVibrationRepair(
+            channel: NotificationChannel,
+            pattern: LongArray,
+        ): Boolean {
+            if (!channel.shouldVibrate()) return true
+            return channel.vibrationPattern?.contentEquals(pattern) != true
         }
     }
 
@@ -565,17 +631,20 @@ class OrderAlertService : Service() {
         val paymentLabel = friendlyPaymentMethod(paymentMethod)
 
         // ── PendingIntents ─────────────────────────────────────────────────────
-        // Use toInt() to ensure the request code is Int (avoids BigInteger widening on some SDKs).
-        fun requestCode(offset: Int): Int = (orderId.hashCode() or offset).toInt()
+        // Every code is mixed with the order id (multiplication, not `or`) so two
+        // orders can never share a target and have FLAG_UPDATE_CURRENT rewrite the
+        // other one's button.
+        fun requestCode(offset: Int): Int = 0x7FFFFFFF and (31 * orderId.hashCode() + offset)
 
         val acceptIntent = Intent(this, NotificationActionReceiver::class.java).apply {
             action = NotificationHelperModule.ACTION_ACCEPT
             putExtra(NotificationHelperModule.EXTRA_ORDER_ID, orderId)
             putExtra(NotificationHelperModule.EXTRA_ACTION, NotificationHelperModule.ACTION_ACCEPT)
+            putExtra("orderNumber", orderNumber)
         }
         val acceptPending = PendingIntent.getBroadcast(
             this,
-            requestCode(0x10000),
+            NotificationHelperModule.actionRequestCode(orderId, NotificationHelperModule.ACTION_ACCEPT),
             acceptIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
@@ -584,10 +653,11 @@ class OrderAlertService : Service() {
             action = NotificationHelperModule.ACTION_REJECT
             putExtra(NotificationHelperModule.EXTRA_ORDER_ID, orderId)
             putExtra(NotificationHelperModule.EXTRA_ACTION, NotificationHelperModule.ACTION_REJECT)
+            putExtra("orderNumber", orderNumber)
         }
         val rejectPending = PendingIntent.getBroadcast(
             this,
-            requestCode(0x20000),
+            NotificationHelperModule.actionRequestCode(orderId, NotificationHelperModule.ACTION_REJECT),
             rejectIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
