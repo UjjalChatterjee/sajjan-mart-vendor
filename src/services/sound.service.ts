@@ -15,9 +15,14 @@
  *   New Order  →  startOrderAlertSound()  →  alert.mp3 loops
  *   Accept     →  stopOrderAlertSound()   →  playback stops
  *   Reject     →  stopOrderAlertSound()   →  playback stops
+ *
+ * The ENABLE_NOTIFICATION_SOUND switch in ../config/notificationSound gates
+ * startOrderAlertSound() — stopOrderAlertSound() stays unconditional so a
+ * mute/un-mute change can never leave audio playing.
  */
 
 import { Platform, NativeModules } from 'react-native';
+import { isNotificationSoundEnabled } from '../config/notificationSound';
 
 /* ── Types ── */
 
@@ -54,6 +59,13 @@ let activeOrderId: string | null = null;
  * If already playing for the same order, this is a no-op.
  */
 export function startOrderAlertSound(data: OrderAlertData): void {
+  if (!isNotificationSoundEnabled()) {
+    if (__DEV__) {
+      console.log('[SOUND] Muted by ENABLE_NOTIFICATION_SOUND — playback skipped');
+    }
+    return;
+  }
+
   if (activeOrderId === data.orderId) {
     if (__DEV__) {
       console.log('[SOUND] Already playing for this order, skipping');

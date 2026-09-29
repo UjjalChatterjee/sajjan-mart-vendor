@@ -53,6 +53,21 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
         const val EXTRA_ORDER_ID = "order_id"
         const val EXTRA_ACTION = "order_action"
 
+        private const val PREFS_NAME = "sajjanmart_notifications"
+        private const val KEY_SOUND_ENABLED = "order_alert_sound_enabled"
+
+        /**
+         * Read the notification-sound switch that JS publishes from
+         * src/config/notificationSound (ENABLE_NOTIFICATION_SOUND).
+         *
+         * Defaults to enabled until JS writes a value, so a fresh install or a
+         * push handled before the bundle ever ran still sounds.
+         */
+        @JvmStatic
+        fun isNotificationSoundEnabled(context: Context): Boolean =
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getBoolean(KEY_SOUND_ENABLED, true)
+
         @Volatile
         var instance: NotificationHelperModule? = null
             private set
@@ -198,6 +213,24 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
     /* ── Alert Sound (Foreground: sound only, no notification) ── */
 
     /**
+     * JS call: NotificationHelper.setNotificationSoundEnabled(true | false)
+     *
+     * Persists the centralized ENABLE_NOTIFICATION_SOUND switch so the
+     * native-only alert path (CustomMessagingReceiver → OrderAlertService),
+     * which runs without the JS bundle, can honour it. Affects audio only —
+     * notifications, vibration and ACCEPT/REJECT are untouched.
+     */
+    @ReactMethod
+    fun setNotificationSoundEnabled(enabled: Boolean) {
+        reactApplicationContext
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_SOUND_ENABLED, enabled)
+            .apply()
+        Log.d(TAG, "[ORDER-ALERT] Notification sound ${if (enabled) "enabled" else "muted"} by JS")
+    }
+
+    /**
      * Play alert.mp3 directly via MediaPlayer — NO foreground service,
      * NO notification. Used by the in-app modal when the app is in
      * the foreground so no system notification appears over the popup.
@@ -206,6 +239,10 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
      */
     @ReactMethod
     fun startForegroundSound() {
+        if (!isNotificationSoundEnabled(reactApplicationContext)) {
+            Log.d(TAG, "[ORDER-ALERT] Notification sound muted — foreground playback skipped")
+            return
+        }
         if (foregroundPlaying) {
             Log.d(TAG, "[ORDER-ALERT] Foreground sound already playing, skipping")
             return

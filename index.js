@@ -17,6 +17,12 @@ import {
   registerBackgroundHandler,
   registerHeadlessTask,
 } from './src/services/notification.service';
+import { syncNotificationSoundFlag } from './src/config/notificationSound';
+
+// Publish the notification-sound switch to native storage. Runs in every JS
+// runtime start-up (main app, background message, headless task) so the
+// native-only alert path honours it.
+syncNotificationSoundFlag();
 
 // Register the React app
 AppRegistry.registerComponent(appName, () => App);

@@ -34,7 +34,9 @@ import {
   setTappedOrderHandler,
   removeTappedOrderHandler,
   stopNativeOrderAlert,
+  markOrderAlerted,
 } from '../services/notification.service';
+import { stopOrderAlertSound } from '../services/sound.service';
 import { ErrorModal } from '../components/ErrorModal';
 import { CancelRequestOrderCard } from '../components/CancelRequestOrderCard';
 import type { Order, OrderItem } from '../types';
@@ -154,8 +156,9 @@ export function OrdersScreen() {
   const [activeTab, setActiveTab] = useState('new_order');
   const [newOrderVisible, setNewOrderVisible] = useState(false);
   const [pendingNewOrder, setPendingNewOrder] = useState<Order | null>(null);
-  // Order ids already surfaced via notification tap — prevents double-open popups
-  const tappedOrderIds = useRef<Set<string>>(new Set());
+  // Alert dedup lives in notification.service (markOrderAlerted) so the
+  // foreground push, the buffered replay, the tap and the killed-launch paths
+  // all share one guard.
   const [errorModalVisible, setErrorModalVisible] = useState(false);
   const [errorModalMessage, setErrorModalMessage] = useState('');
   const [acceptingId, setAcceptingId] = useState<string | null>(null);
@@ -236,10 +239,9 @@ export function OrdersScreen() {
 
     // NEW_ORDER notification tap: open the same modal (deduped by order id)
     const openTappedOrder = (orderId: string) => {
-      if (!orderId || tappedOrderIds.current.has(orderId)) {
+      if (!orderId || !markOrderAlerted(orderId)) {
         return;
       }
-      tappedOrderIds.current.add(orderId);
       console.log('[ORDER-ALERT] Incoming order via notification tap');
 
       // Stop the native OrderAlertService (sound + volume bump) before the
@@ -275,11 +277,8 @@ export function OrdersScreen() {
     handleInitialNotification().then(data => {
       if (data) {
         console.log('[ORDER-ALERT] Pending order from killed-state launch');
-        if (data.orderId && tappedOrderIds.current.has(data.orderId)) {
+        if (data.orderId && !markOrderAlerted(data.orderId)) {
           return;
-        }
-        if (data.orderId) {
-          tappedOrderIds.current.add(data.orderId);
         }
         const incoming = buildOrderFromNotification(data);
         setPendingNewOrder(incoming);
@@ -300,6 +299,11 @@ export function OrdersScreen() {
     return () => {
       removeIncomingOrderHandler();
       removeTappedOrderHandler();
+      // Navigating away (Settings / Notification Settings) unmounts the modal
+      // without it ever reaching Accept/Reject. Without this the native
+      // MediaPlayer keeps looping for the rest of the process life, and its
+      // "already playing" guard then mutes every later alert.
+      stopOrderAlertSound();
     };
   }, []);
 

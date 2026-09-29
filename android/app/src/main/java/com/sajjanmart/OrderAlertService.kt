@@ -63,8 +63,15 @@ class OrderAlertService : Service() {
         @Volatile
         private var sharedStreamType: Int = AudioManager.STREAM_ALARM
 
+        /** True once an alert has actually captured the pre-alert stream state, so a
+         *  restore can never write a stale default volume back to the alarm stream. */
+        @Volatile
+        private var sharedStreamStateCaptured: Boolean = false
+
         @JvmStatic
         private fun restoreSharedStreamState(context: Context) {
+            if (!sharedStreamStateCaptured) return
+            sharedStreamStateCaptured = false
             if (sharedStreamType != AudioManager.STREAM_ALARM) return
             if (sharedPrevVolume < 0) return
             try {
@@ -143,6 +150,7 @@ class OrderAlertService : Service() {
             sharedStreamType = streamType
             sharedPrevVolume = prevVolume
             sharedStreamMax = maxVolume
+            sharedStreamStateCaptured = true
         }
 
         /** Map raw FCM paymentMethod values to human-readable labels.
@@ -232,7 +240,7 @@ class OrderAlertService : Service() {
     private var audioManager: AudioManager? = null
     private var audioFocusToken: Any? = null
     private var audioFocusRequest: AudioFocusRequest? = null
-    private var previousStreamVolume = 0
+    private var previousStreamVolume = -1
     private var streamMaxVolume = 0
     private var alertStreamType = AudioManager.STREAM_ALARM
 
@@ -330,6 +338,15 @@ class OrderAlertService : Service() {
                 Log.d(TAG, "Playback already active or player exists — skipping duplicate start")
                 return
             }
+
+            // Centralized sound switch: skip audio only. The service keeps running,
+            // so the NEW_ORDER notification, its channel vibration and the
+            // ACCEPT / REJECT actions all stay exactly as they are.
+            if (!NotificationHelperModule.isNotificationSoundEnabled(applicationContext)) {
+                Log.d(TAG, "[ORDER-ALERT] Notification sound muted — playback skipped")
+                return
+            }
+
             isPlaying = true
 
             try {

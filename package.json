@@ -2,16 +2,16 @@
   "name": "SajjanMart",
   "version": "0.0.1",
   "private": true,
-"scripts": {
-  "android": "react-native run-android",
-  "android:release": "cd android && gradlew assembleRelease",
-  "android:clean": "cd android && gradlew clean",
-  "android:release:clean": "cd android && gradlew clean && gradlew assembleRelease",
-  "ios": "react-native run-ios",
-  "lint": "eslint .",
-  "start": "react-native start",
-  "test": "jest"
-},
+  "scripts": {
+    "android": "react-native run-android",
+    "android:release": "cd android && gradlew assembleRelease",
+    "android:clean": "cd android && gradlew clean",
+    "android:release:clean": "cd android && gradlew clean && gradlew assembleRelease",
+    "ios": "react-native run-ios",
+    "lint": "eslint .",
+    "start": "react-native start",
+    "test": "jest"
+  },
   "dependencies": {
     "@react-native-async-storage/async-storage": "^3.1.1",
     "@react-native-firebase/app": "^26.2.0",

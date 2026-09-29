@@ -19,17 +19,38 @@ import { NotificationSettingsScreen } from './src/screens/NotificationSettingsSc
 import { SettingsScreen } from './src/screens/SettingsScreen';
 import { Colors } from './src/theme/colors';
 import { SplashScreen } from './src/components/SplashScreen';
+import {
+  initializeNotifications,
+  resetNotificationInitialization,
+} from './src/services/notification.service';
 
 /**
  * Screen router — decides between auth screens and the main app.
  */
 function AppContent() {
-  const { isInitialized, isAuthenticated } = useAuth();
+  const { isInitialized, isAuthenticated, user } = useAuth();
   const { state, resetHistoryToLogin } = useNavigation();
   const wasAuthenticated = useRef(isAuthenticated);
   const [showSplash, setShowSplash] = useState(true);
 
   console.log('[APP] AppContent render: isInitialized=', isInitialized, '| isAuthenticated=', isAuthenticated, '| nav screen=', state.screen, '| showSplash=', showSplash);
+
+  /* FCM bootstrap for EVERY authenticated session — including sessions
+     restored on app restart, where LoginScreen is never mounted.
+     initializeNotifications() is idempotent per user id. */
+  useEffect(() => {
+    if (!isAuthenticated) {
+      resetNotificationInitialization();
+      return;
+    }
+    console.log('[APP] Authenticated session — ensuring notifications are initialized');
+    initializeNotifications(user?.id ?? null).catch(err => {
+      console.warn(
+        '[APP] Notification initialization failed:',
+        err instanceof Error ? err.message : String(err),
+      );
+    });
+  }, [isAuthenticated, user?.id]);
 
   /* When auth drops to false (logout / token expiry), always reset nav to login */
   useEffect(() => {

@@ -23,7 +23,6 @@ import {
   fetchCurrentUser,
   isApiError,
 } from '../services/auth.service';
-import { initializeNotifications } from '../services/notification.service';
 import { useToast } from '../context/ToastContext';
 import { ErrorModal } from '../components/ErrorModal';
 
@@ -145,8 +144,8 @@ export function LoginScreen() {
       // Show success toast
       showSuccess('Login successful');
 
-      // Initialize FCM notifications after successful login.
-      await initializeNotifications();
+      // FCM initialization is handled by App.tsx's authenticated-session
+      // effect, which also covers restored sessions after an app restart.
       navigate('orders');
     } catch (error: unknown) {
       if (isApiError(error, 401)) {
