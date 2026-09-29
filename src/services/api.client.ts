@@ -6,13 +6,19 @@
  * inside individual screens or services.
  *
  * Includes automatic 401 → refresh → retry logic:
- *   1. On 401, attempt a token refresh via POST /api/auth/refresh
- *      with the stored refreshToken sent as a Cookie header.
- *   2. On success, update the stored access token and retry the
- *      original request once.
- *   3. On refresh failure (401), clear auth and notify listeners.
+ *   1. On 401, attempt a token refresh via POST /api/auth/refresh, sending
+ *      the stored refresh token in the JSON request body.
+ *   2. On success, store the new access and refresh tokens from the JSON
+ *      response and retry the original request once.
+ *   3. Only a server-confirmed rejection of the refresh token clears the
+ *      credentials and signs the user out. Offline, timeouts and 5xx
+ *      responses keep the session.
  *   4. Concurrent 401s share a single in-flight refresh request.
  *   5. If the retry itself returns 401, the loop stops (no infinite loop).
+ *
+ * Authentication is purely token based: the Authorization Bearer header and
+ * the JSON body carry every credential. No Cookie header is sent and no
+ * Set-Cookie value is read, so nothing depends on a cookie jar.
  */
 
 import { Env } from '../config/env';
@@ -41,7 +47,17 @@ export interface ApiErrorResponse {
 /* ── Error class ────────────────────────────────────────────────────── */
 
 export class ApiError extends Error {
-  constructor(public status: number, message: string) {
+  constructor(
+    public status: number,
+    message: string,
+    /**
+     * True only when the server confirmed that the session itself is no
+     * longer usable (expired/invalid/deactivated refresh token). Transport
+     * failures (offline, abort, 5xx) never set this, so they can never sign
+     * the user out.
+     */
+    public sessionInvalid = false,
+  ) {
     super(message);
     this.name = 'ApiError';
   }
@@ -70,8 +86,8 @@ function notifyAuthExpired(): void {
 /* ── Refresh-token state ────────────────────────────────────────────── */
 
 /**
- * Refresh queue: concurrent401 callers push their resolve/reject here.
- * The first401 caller drives the refresh; subsequent ones just wait.
+ * Refresh queue: concurrent 401 callers push their resolve/reject here.
+ * The first 401 caller drives the refresh; subsequent ones just wait.
  */
 let refreshQueue: {
   resolve: (token: string) => void;
@@ -82,38 +98,109 @@ let refreshQueue: {
 let isRefreshing = false;
 
 /**
- * Parse a cookie value from a Set-Cookie header.
- * Handles: "refreshToken=abc123; Path=/; HttpOnly" → "abc123"
+ * fetch() with a hard deadline.
+ *
+ * Without it a request that never answers leaves `isRefreshing` true for the
+ * life of the process, and every later 401 queues behind a promise that can
+ * only settle at the OS socket timeout.
  */
-function parseCookieValue(
-  setCookieHeader: string | null,
-  name: string,
-): string | null {
-  if (!setCookieHeader) return null;
-  const cookies = setCookieHeader.split(/,(?=\s*\w+=)/);
-  for (const cookie of cookies) {
-    const trimmed = cookie.trim();
-    if (trimmed.startsWith(`${name}=`)) {
-      const value = trimmed.split(';')[0]?.split('=')[1]?.trim();
-      return value || null;
-    }
+function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, { ...init, signal: controller.signal }).finally(() =>
+    clearTimeout(timer),
+  );
+}
+
+/**
+ * Perform the refresh round-trip.
+ *
+ * POST /api/auth/refresh with body { refreshToken: "<stored token>" } —
+ * purely token based: no Cookie header, no Set-Cookie parsing, no cookie jar.
+ *
+ * Returns the new access token on success.
+ *
+ * Throws ApiError with sessionInvalid = true only when the server rejected
+ * the refresh token. Everything else (offline, abort, 5xx, an unexpected
+ * body) is a transport or contract problem that must not end the session.
+ */
+async function performTokenRefresh(): Promise<string> {
+  const refreshToken = await getRefreshToken();
+
+  // Storage holds no refresh token at all, so the session cannot be renewed
+  // and is treated as invalidated.
+  if (!refreshToken) {
+    throw new ApiError(401, 'No refresh token available', true);
   }
-  return null;
+
+  let response: Response;
+  try {
+    response = await fetchWithTimeout(
+      `${Env.API_BASE_URL}/api/auth/refresh`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({ refreshToken }),
+      },
+      Env.API_TIMEOUT,
+    );
+  } catch {
+    // Offline, DNS failure or our own abort: proves nothing about the session.
+    throw new ApiError(0, 'Refresh request could not reach the server');
+  }
+
+  // 401 = expired/invalid token, 403 = deactivated account. Both are the
+  // server's verdict on the session itself.
+  if (response.status === 401 || response.status === 403) {
+    throw new ApiError(response.status, 'Refresh token expired or invalid', true);
+  }
+
+  if (!response.ok) {
+    throw new ApiError(response.status, `Refresh failed (${response.status})`);
+  }
+
+  let json: {
+    accessToken?: string;
+    token?: string;
+    refreshToken?: string;
+  };
+  try {
+    json = await response.json();
+  } catch {
+    throw new ApiError(0, 'Refresh returned a non-JSON body');
+  }
+
+  // /api/auth/refresh returns { success, accessToken, refreshToken }.
+  const newAccessToken = json.accessToken ?? json.token;
+  if (!newAccessToken) {
+    throw new ApiError(0, 'No access token in refresh response');
+  }
+
+  await saveAccessToken(newAccessToken);
+  // saveRefreshToken ignores empty/null/undefined, so a response without a
+  // rotated token can never overwrite the valid stored one.
+  await saveRefreshToken(json.refreshToken);
+
+  return newAccessToken;
 }
 
 /**
  * Attempt to refresh the access token.
  *
- * POST /api/auth/refresh
- * Cookie header: refreshToken=<stored refreshToken>
+ * Returns the new access token on success; throws on failure so the original
+ * request surfaces its own 401.
  *
- * Returns the new access token on success.
- * Throws ApiError(401) on failure (caller should sign out).
- *
- * Concurrent401 callers share a single in-flight request.
- * On success: all queued callers receive the new token.
- * On failure: all queued callers receive the error.
- *            Tokens are cleared and the auth-expired listener fires once.
+ * Concurrent 401 callers share a single in-flight request:
+ *   - On success every queued caller receives the new token.
+ *   - On failure every queued caller receives the same error, and credentials
+ *     are cleared only when the server invalidated the session.
  */
 async function refreshAccessToken(): Promise<string> {
   // If a refresh is already in-flight, queue this caller
@@ -126,58 +213,7 @@ async function refreshAccessToken(): Promise<string> {
   isRefreshing = true;
 
   try {
-    const refreshToken = await getRefreshToken();
-
-    // No refresh token stored → cannot refresh
-    if (!refreshToken) {
-      throw new ApiError(401, 'No refresh token available');
-    }
-
-    const url = `${Env.API_BASE_URL}/api/auth/refresh`;
-
-    const response = await fetch(url, {
-      method: 'POST',
-      credentials: 'include',
-      headers: {
-        'Content-Type': 'application/json',
-        // Send the refresh token as a Cookie header — NOT in the body
-        Cookie: `refreshToken=${refreshToken}`,
-      },
-    });
-
-    if (response.status === 401) {
-      throw new ApiError(401, 'Refresh token expired or invalid');
-    }
-
-    if (!response.ok) {
-      throw new ApiError(
-        response.status,
-        `Refresh failed (${response.status})`,
-      );
-    }
-
-    const json = await response.json();
-
-    // Backend returns { token, user } on success
-    const newAccessToken: string = json.token;
-    if (!newAccessToken) {
-      throw new ApiError(401, 'No token in refresh response');
-    }
-
-    // Persist the new access token
-    await saveAccessToken(newAccessToken);
-
-    // If the backend rotated the refresh token, save the new one
-    if (json.refreshToken) {
-      await saveRefreshToken(json.refreshToken);
-    }
-
-    // Also check the Set-Cookie header for a new refresh token
-    const setCookie = response.headers.get('set-cookie');
-    const cookieRefreshToken = parseCookieValue(setCookie, 'refreshToken');
-    if (cookieRefreshToken) {
-      await saveRefreshToken(cookieRefreshToken);
-    }
+    const newAccessToken = await performTokenRefresh();
 
     // Resolve ALL queued callers with the new token
     for (const entry of refreshQueue) {
@@ -187,18 +223,23 @@ async function refreshAccessToken(): Promise<string> {
 
     return newAccessToken;
   } catch (err) {
-    // Refresh failed — clear ALL auth data and notify once
-    await clearAuthTokens();
-    notifyAuthExpired();
+    const error =
+      err instanceof ApiError
+        ? err
+        : new ApiError(0, err instanceof Error ? err.message : String(err));
+
+    if (error.sessionInvalid) {
+      await clearAuthTokens();
+      notifyAuthExpired();
+    }
 
     // Reject ALL queued callers with the same error
-    const error = err instanceof Error ? err : new Error(String(err));
     for (const entry of refreshQueue) {
       entry.reject(error);
     }
     refreshQueue = [];
 
-    throw err;
+    throw error;
   } finally {
     isRefreshing = false;
   }
@@ -230,12 +271,23 @@ async function fetchJson<T>(
 ): Promise<{ data: T; response: Response }> {
   const response = await fetch(url, {
     method,
-    credentials: 'include',
     headers,
     body: body != null ? JSON.stringify(body) : undefined,
   });
 
-  const json: ApiResponse<T> | ApiErrorResponse = await response.json();
+  const rawText = await response.text();
+  let json: ApiResponse<T> | ApiErrorResponse;
+  try {
+    json = JSON.parse(rawText) as ApiResponse<T> | ApiErrorResponse;
+  } catch {
+    // A gateway/cold-start HTML page is not an API contract answer. Keep the
+    // HTTP status so a 401 can still trigger a refresh and a 5xx stays a
+    // transient failure instead of a raw SyntaxError.
+    throw new ApiError(
+      response.status,
+      rawText.slice(0, 200) || `Request failed (${response.status})`,
+    );
+  }
 
   if (
     !response.ok ||
@@ -340,9 +392,10 @@ export async function apiPut<T>(
 }
 
 /**
- * POST that also returns the raw Response (for reading Set-Cookie headers).
- * Used by auth.service.ts to capture the refreshToken cookie after login/signup.
- * Does NOT send an existing access token — login/signup are unauthenticated.
+ * POST for an unauthenticated endpoint (login/signup/register).
+ *
+ * Unlike request(), it never attaches a stored bearer token — the credential
+ * pair comes back in the JSON body and is persisted by the caller.
  */
 export async function apiPostWithResponse<T>(
   path: string,

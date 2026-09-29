@@ -4,10 +4,11 @@
  * Centralised data layer for authentication operations.
  * Uses the reusable API client so the base URL is never hard-coded.
  *
- * On login/signup, the backend sets a refreshToken as an httpOnly cookie.
- * React Native's fetch does NOT auto-manage cookies like a browser, so we
- * extract the refreshToken from the Set-Cookie header and store it in
- * AsyncStorage for later use in refresh requests.
+ * Authentication is purely token based. /api/auth/login and /api/auth/signup
+ * return { accessToken, refreshToken } in the JSON body and those values are
+ * the only ones this app reads — the accompanying httpOnly cookies belong to
+ * the web client and are deliberately ignored here (no Cookie header is ever
+ * sent, no Set-Cookie header is ever parsed).
  */
 
 import { apiGet, apiPostWithResponse, ApiError } from './api.client';
@@ -37,28 +38,25 @@ export interface AuthResult {
   refreshToken: string;
 }
 
-/* ── Cookie parser ──────────────────────────────────────────────────── */
-
 /**
- * Extract a cookie value from a Set-Cookie header string.
- * Handles: "refreshToken=abc123; Path=/; HttpOnly" → "abc123"
+ * Login/signup/register return the access token as `accessToken`; older builds
+ * named it `token`. Only the JSON body is ever read.
  */
-function parseCookieValue(
-  setCookieHeader: string | null,
-  name: string,
-): string | null {
-  if (!setCookieHeader) return null;
-  // A single Set-Cookie header may contain multiple cookies separated by commas
-  // but fetch in RN typically gives us one. Split on ", " for safety.
-  const cookies = setCookieHeader.split(/,(?=\s*\w+=)/);
-  for (const cookie of cookies) {
-    const trimmed = cookie.trim();
-    if (trimmed.startsWith(`${name}=`)) {
-      const value = trimmed.split(';')[0]?.split('=')[1]?.trim();
-      return value || null;
-    }
-  }
-  return null;
+interface TokenResponse {
+  token?: string;
+  accessToken?: string;
+  refreshToken?: string;
+  user: StoredUser;
+}
+
+function readTokenPair(body: TokenResponse): {
+  accessToken: string;
+  refreshToken: string;
+} {
+  return {
+    accessToken: body.accessToken || body.token || '',
+    refreshToken: body.refreshToken || '',
+  };
 }
 
 /* ── Public API ─────────────────────────────────────────────────────── */
@@ -69,7 +67,6 @@ function parseCookieValue(
  * POST /api/auth/register
  * Sends: { username, password, confirmPassword }
  * Backend returns: { user, accessToken, refreshToken }
- * Backend also sets refreshToken as httpOnly cookie.
  *
  * On success, tokens are persisted and caller is ready to navigate
  * to the authenticated app.
@@ -79,21 +76,15 @@ export async function register(
   password: string,
   confirmPassword: string,
 ): Promise<AuthResult> {
-  // Pass undefined as token — register is an unauthenticated endpoint
-  const { data: result, response } = await apiPostWithResponse<AuthResult>(
+  const { data: result } = await apiPostWithResponse<AuthResult>(
     '/api/auth/register',
     { username, password, confirmPassword },
   );
 
-  // Extract refreshToken from Set-Cookie header
-  const setCookie = response.headers.get('set-cookie');
-  const cookieRefreshToken = parseCookieValue(setCookie, 'refreshToken');
+  // Both tokens come from the JSON response body.
+  await saveAuthTokens(result.accessToken, result.refreshToken, result.user);
 
-  // Persist tokens and user info securely
-  const rt = cookieRefreshToken || result.refreshToken || '';
-  await saveAuthTokens(result.accessToken, rt, result.user);
-
-  return { ...result, refreshToken: rt };
+  return { ...result, refreshToken: result.refreshToken };
 }
 
 /**
@@ -101,8 +92,8 @@ export async function register(
  *
  * POST /api/auth/signup
  * Sends: { email, password, fullName }
- * Backend returns: { token, user } with user having { id, email, name, role }
- * Backend also sets httpOnly cookie: refreshToken=<jwt>
+ * Backend returns: { ...tokens, user } — accessToken and refreshToken are both
+ * in the JSON body and are the only values read here.
  *
  * On success, tokens are persisted and caller is ready to navigate
  * to the authenticated app.
@@ -112,32 +103,19 @@ export async function signup(
   password: string,
   fullName: string,
 ): Promise<AuthResult> {
-  // Pass undefined as token — signup is an unauthenticated endpoint
-  const { data: rawResult, response } = await apiPostWithResponse<{
-    token?: string;
-    accessToken?: string;
-    user: StoredUser;
-  }>('/api/auth/signup', { email, password, fullName });
+  const { data: rawResult } = await apiPostWithResponse<TokenResponse>(
+    '/api/auth/signup',
+    { email, password, fullName },
+  );
 
-  // Extract refreshToken from Set-Cookie header
-  const setCookie = response.headers.get('set-cookie');
-  const cookieRefreshToken = parseCookieValue(setCookie, 'refreshToken');
+  const tokens = readTokenPair(rawResult);
 
-  // Backend may return `token` or `accessToken` — normalise
-  const tokenValue =
-    (rawResult as any).token || (rawResult as any).accessToken || '';
-
-  // Backend may return refreshToken in JSON body or Set-Cookie header
-  const refreshTokenValue =
-    cookieRefreshToken || (rawResult as any).refreshToken || '';
-
-  // Persist tokens and user info securely
-  await saveAuthTokens(tokenValue, refreshTokenValue, rawResult.user);
+  await saveAuthTokens(tokens.accessToken, tokens.refreshToken, rawResult.user);
 
   return {
     user: rawResult.user,
-    accessToken: tokenValue,
-    refreshToken: refreshTokenValue,
+    accessToken: tokens.accessToken,
+    refreshToken: tokens.refreshToken,
   };
 }
 
@@ -146,8 +124,8 @@ export async function signup(
  *
  * POST /api/auth/login
  * Sends: { email, password }
- * Backend returns: { token, user } with user having { id, email, name, role }
- * Backend also sets httpOnly cookie: refreshToken=<jwt>
+ * Backend returns: { ...tokens, user } — accessToken and refreshToken are both
+ * in the JSON body and are the only values read here.
  *
  * On success, tokens are persisted and caller is ready to navigate
  * to the authenticated app.
@@ -156,38 +134,28 @@ export async function login(
   email: string,
   password: string,
 ): Promise<AuthResult> {
-  // Pass undefined as token to prevent sending a stale Authorization header
-  // on this unauthenticated endpoint.
-  const { data: rawResult, response } = await apiPostWithResponse<{
-    token?: string;
-    accessToken?: string;
-    user: StoredUser;
-  }>('/api/auth/login', { email, password });
+  const { data: rawResult } = await apiPostWithResponse<TokenResponse>(
+    '/api/auth/login',
+    { email, password },
+  );
 
-  // Extract refreshToken from Set-Cookie header
-  const setCookie = response.headers.get('set-cookie');
-  const cookieRefreshToken = parseCookieValue(setCookie, 'refreshToken');
+  const tokens = readTokenPair(rawResult);
 
-  // Backend may return `token` or `accessToken` — normalise
-  const tokenValue =
-    (rawResult as any).token || (rawResult as any).accessToken || '';
-
-  // Backend may return refreshToken in JSON body or Set-Cookie header
-  const refreshTokenValue =
-    cookieRefreshToken || (rawResult as any).refreshToken || '';
-
-  // Persist tokens and user info securely
-  await saveAuthTokens(tokenValue, refreshTokenValue, rawResult.user);
+  await saveAuthTokens(tokens.accessToken, tokens.refreshToken, rawResult.user);
 
   return {
     user: rawResult.user,
-    accessToken: tokenValue,
-    refreshToken: refreshTokenValue,
+    accessToken: tokens.accessToken,
+    refreshToken: tokens.refreshToken,
   };
 }
 
 /**
- * Logout — clears stored tokens.
+ * Logout — asks the server to end the session (best-effort), then clears
+ * locally stored tokens.
+ *
+ * No cookie transport is used: the request carries the refresh token in the
+ * JSON body, exactly like the other auth endpoints.
  */
 export async function logout(): Promise<void> {
   try {
@@ -197,7 +165,6 @@ export async function logout(): Promise<void> {
       // Attempt to revoke on the server (best-effort)
       await fetch(`${Env.API_BASE_URL}/api/auth/logout`, {
         method: 'POST',
-        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ refreshToken }),
       }).catch(() => {});

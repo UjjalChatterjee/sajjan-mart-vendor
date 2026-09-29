@@ -1,8 +1,15 @@
 /**
  * Auth Context
  *
- * Manages authentication state across the app.
- * Checks for stored tokens on startup and provides login/logout/register actions.
+ * Owns authentication state for the app.
+ *
+ * On mount it restores the session from the stored tokens before exposing the
+ * app: the splash screen (see App.tsx) stays visible until `isInitialized`
+ * flips, so the login screen is never briefly shown while restoration is in
+ * progress. Restoration only ends the session when the server rejects the
+ * credentials; a network error keeps the user signed in from the cached
+ * profile, and the request itself is bounded by a deadline so the splash can
+ * never hang forever.
  */
 
 import React, {
@@ -14,9 +21,25 @@ import React, {
   ReactNode,
 } from 'react';
 import type { StoredUser } from '../services/tokenStorage';
-import { getStoredUser, hasStoredAuth, clearAuthTokens } from '../services/tokenStorage';
+import {
+  getStoredUser,
+  hasStoredAuth,
+  clearAuthTokens,
+} from '../services/tokenStorage';
 import { onAuthExpired, ApiError } from '../services/api.client';
 import { fetchCurrentUser } from '../services/auth.service';
+import { queryClient } from '../services/queryClient';
+import { Env } from '../config/env';
+
+/* ── Logging ────────────────────────────────────────────────────────── */
+
+/**
+ * Dev-only diagnostic log. The full text never includes a token, but these
+ * lines describe session state, so they are stripped from release builds.
+ */
+function log(...args: unknown[]): void {
+  if (__DEV__) console.log(...args);
+}
 
 /* ── Types ──────────────────────────────────────────────────────────── */
 
@@ -42,6 +65,33 @@ type AuthContextType = AuthState & AuthActions;
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
+/* ── Startup helper ─────────────────────────────────────────────────── */
+
+/**
+ * Reject if `promise` has not settled within `timeoutMs`.
+ *
+ * The fetch inside fetchCurrentUser has no deadline of its own; without this a
+ * request that never answers would leave the splash screen up indefinitely.
+ */
+function withDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new ApiError(0, `Auth check timed out (${timeoutMs}ms)`)),
+      timeoutMs,
+    );
+    promise.then(
+      value => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      err => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
 /* ── Provider ───────────────────────────────────────────────────────── */
 
 export function AuthProvider({ children }: { children: ReactNode }) {
@@ -51,71 +101,76 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     user: null,
   });
 
-  /* On mount: check for stored auth */
+  /* On mount: restore the session from stored credentials */
   useEffect(() => {
     let cancelled = false;
 
-    (async () => {
-      try {
-        console.log('[AUTH-CTX] startup: checking stored auth...');
-        const hasAuth = await hasStoredAuth();
-        console.log('[AUTH-CTX] startup: hasStoredAuth =', hasAuth);
-        if (cancelled) return;
-
-        if (hasAuth) {
-          // Verify the token is still valid by calling /me BEFORE showing anything.
-          // Loading spinner stays visible until we confirm the token works.
-          try {
-            console.log('[AUTH-CTX] startup: calling fetchCurrentUser()...');
-            const freshUser = await fetchCurrentUser();
-            console.log('[AUTH-CTX] startup: fetchCurrentUser SUCCESS, user:', freshUser?.username);
-            if (!cancelled) {
-              setState({
-                isInitialized: true,
-                isAuthenticated: true,
-                user: freshUser,
-              });
-              console.log('[AUTH-CTX] startup: setState isAuthenticated=true');
-            }
-          } catch (err) {
-            // Token invalid or user deleted — clear auth and show login
-            const isAuthError = err instanceof ApiError && err.status === 401;
-            console.log('[AUTH-CTX] startup: fetchCurrentUser FAILED');
-            console.log('[AUTH-CTX] startup: error type:', err?.constructor?.name, '| is401:', isAuthError, '| message:', err instanceof Error ? err.message : err);
-            if (!cancelled) {
-              if (isAuthError) {
-                console.log('[AUTH-CTX] startup: AUTH ERROR (401) — clearing tokens, setting isAuthenticated=false');
-                await clearAuthTokens();
-                setState({ isInitialized: true, isAuthenticated: false, user: null });
-              } else {
-                // Network error — fall back to cached user so app works offline
-                console.log('[AUTH-CTX] startup: NETWORK/OTHER ERROR — falling back to cached user');
-                const cachedUser = await getStoredUser();
-                console.log('[AUTH-CTX] startup: cached user:', cachedUser?.username ?? 'null');
-                setState({
-                  isInitialized: true,
-                  isAuthenticated: true,
-                  user: cachedUser ?? null,
-                });
-                console.log('[AUTH-CTX] startup: setState isAuthenticated=true (cached fallback)');
-              }
-            }
-          }
-        } else {
-          console.log('[AUTH-CTX] startup: no stored auth, setting isAuthenticated=false');
-          if (!cancelled) {
-            setState({ isInitialized: true, isAuthenticated: false, user: null });
-          }
-        }
-      } catch {
-        console.log('[AUTH-CTX] startup: outer catch — setting isAuthenticated=false');
+    const restoreSession = async () => {
+      if (!(await hasStoredAuth())) {
+        log('[AUTH-CTX] startup: no stored credentials');
         if (!cancelled) {
           setState({ isInitialized: true, isAuthenticated: false, user: null });
         }
+        return;
       }
-    })();
 
-    return () => { cancelled = true; };
+      try {
+        // Confirm with the server before revealing the app.
+        const freshUser = await withDeadline(
+          fetchCurrentUser(),
+          Env.API_TIMEOUT,
+        );
+        log('[AUTH-CTX] startup: session restored for', freshUser?.username);
+        if (!cancelled) {
+          setState({
+            isInitialized: true,
+            isAuthenticated: true,
+            user: freshUser,
+          });
+        }
+      } catch (err) {
+        // 401 is the server's verdict on the session: sign out.
+        const isAuthError = err instanceof ApiError && err.status === 401;
+        log(
+          '[AUTH-CTX] startup: auth check failed:',
+          err instanceof Error ? err.message : err,
+        );
+        if (cancelled) return;
+
+        if (isAuthError) {
+          await clearAuthTokens();
+          setState({ isInitialized: true, isAuthenticated: false, user: null });
+          return;
+        }
+
+        // Offline / timeout / 5xx proves nothing about the session. Restore
+        // from the cached profile — but only if credentials are still stored
+        // (a refresh failure during the call may have cleared them).
+        if (await hasStoredAuth()) {
+          const cachedUser = await getStoredUser();
+          log('[AUTH-CTX] startup: offline fallback to cached user');
+          setState({
+            isInitialized: true,
+            isAuthenticated: true,
+            user: cachedUser,
+          });
+          return;
+        }
+
+        setState({ isInitialized: true, isAuthenticated: false, user: null });
+      }
+    };
+
+    restoreSession().catch(async () => {
+      // Storage itself failed — nothing to restore, but never block the splash.
+      if (!cancelled) {
+        setState({ isInitialized: true, isAuthenticated: false, user: null });
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const setAuthenticated = useCallback((user: StoredUser) => {
@@ -124,21 +179,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const signOut = useCallback(async (onSignOut?: () => void) => {
     await clearAuthTokens();
+    // Drop cached data so the next session cannot read the previous user's
+    // orders/products from memory.
+    queryClient.clear();
     setState({ isInitialized: true, isAuthenticated: false, user: null });
     onSignOut?.();
   }, []);
 
   // Register the auth-expired callback so the API client can trigger
-  // signOut when a refresh token is expired/invalid.
+  // signOut when the server rejects the refresh token.
   useEffect(() => {
-    console.log('[AUTH-CTX] registering onAuthExpired listener');
+    log('[AUTH-CTX] registering onAuthExpired listener');
     const unsubscribe = onAuthExpired(async () => {
-      console.log('[AUTH-CTX] onAuthExpired FIRED — clearing tokens and setting isAuthenticated=false');
-      // Clear any remaining stored tokens
+      log('[AUTH-CTX] onAuthExpired — session invalidated by server');
       await clearAuthTokens();
-      console.log('[AUTH-CTX] onAuthExpired: tokens cleared, setting state');
+      queryClient.clear();
       setState({ isInitialized: true, isAuthenticated: false, user: null });
-      console.log('[AUTH-CTX] onAuthExpired: setState complete');
     });
     return unsubscribe;
   }, []);
