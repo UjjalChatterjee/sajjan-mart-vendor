@@ -76,6 +76,9 @@ export function OrderStoreProvider({ children }: { children: ReactNode }) {
       await orderService.rejectOrder(id);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to reject order');
+      // Rethrow: callers must be able to tell a real failure — and the 409
+      // "already decided on another device" case — from a successful reject.
+      throw err;
     }
   }, []);
 

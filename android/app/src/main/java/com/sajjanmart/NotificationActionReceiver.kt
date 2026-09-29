@@ -1,6 +1,5 @@
 package com.sajjanmart
 
-import android.app.NotificationManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -49,21 +48,14 @@ class NotificationActionReceiver : BroadcastReceiver() {
 
         Log.d(TAG, "[ORDER-ACTION] $actionName tapped for order $orderId")
 
-        // 3. Stop looping alert sound immediately (0ms latency via singleton)
-        OrderAlertService.stop(context)
-        Log.d(TAG, "[ORDER-ALERT] Sound stopped")
-
-        // 4. Remove order notification and any prior API-failure feedback notification
-        try {
-            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            nm.cancel(OrderAlertService.NOTIFICATION_ID)            // service foreground notif
-            nm.cancel(0x7FFFFFFF and orderId.hashCode())            // per-order notif from JS module
-            nm.cancel(0x4F524445)                                   // FEEDBACK_NOTIF_ID from NativeOrderApiService
-            CustomMessagingReceiver.suppressDuplicateNotifications(context)
-            Log.d(TAG, "[ORDER-ALERT] Notification(s) cancelled")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error cancelling notification", e)
-        }
+        // 3 + 4. Stop the siren (only when this order owns it) and cancel this
+        // order's notification. Both ids are derived from orderId, so no other
+        // pending order's alert — and no other app's notification — is touched.
+        // The decision itself is only recorded once the backend confirms it
+        // (NativeOrderApiService) or a status push arrives, so a failed call
+        // never silently mutes a still-pending order.
+        OrderAlertService.handleOrderResolved(context, orderId)
+        Log.d(TAG, "[ORDER-ALERT] Sound and notification cleared for $orderId")
 
         // 5a. If JS runtime is alive, let JS handle it (updates UI + calls API)
         val jsModule = NotificationHelperModule.instance

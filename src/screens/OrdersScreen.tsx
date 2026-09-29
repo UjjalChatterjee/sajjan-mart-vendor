@@ -24,6 +24,13 @@ import { useOrderStore } from '../store/orderStore';
 import { useToast } from '../context/ToastContext';
 import { useOrders } from '../hooks/useOrders';
 import { processOrderItem, markOrderDispatched, markOrderDelivered, cancelApproveItems, cancelRejectItems, getOrders } from '../services/order.service';
+import { ApiError } from '../services/api.client';
+import {
+  applyOrderDecision,
+  dismissStaleAlert,
+  reconcileAlertsWithBackend,
+  subscribeOrderDecisions,
+} from '../services/orderAlertSync';
 import {
   setIncomingOrderHandler,
   removeIncomingOrderHandler,
@@ -169,6 +176,13 @@ export function OrdersScreen() {
   const hasShownError = useRef(false);
   const hasEverLoaded = useRef(false);
 
+  // Mirror of the modal's order id so the cross-device decision subscriber can
+  // close it without re-creating the effect on every modal change.
+  const pendingOrderIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    pendingOrderIdRef.current = pendingNewOrder?.id ?? null;
+  }, [pendingNewOrder]);
+
   // ── Tab scrolling ──
   const tabsScrollRef = useRef<any>(null);
   const tabLayoutsRef = useRef<Map<string, { x: number; width: number }>>(
@@ -307,27 +321,79 @@ export function OrdersScreen() {
     };
   }, []);
 
+  // Another device (or a notification button) decided one of our alerted
+  // orders: close its modal. Sound, notification and cache are handled by
+  // orderAlertSync — this is only the UI half.
+  useEffect(
+    () =>
+      subscribeOrderDecisions(orderId => {
+        if (pendingOrderIdRef.current !== orderId) return;
+        pendingOrderIdRef.current = null;
+        setNewOrderVisible(false);
+        setPendingNewOrder(null);
+      }),
+    [],
+  );
+
+  // Offline / missed-push recovery: whenever the list refreshes, drop any alert
+  // whose order is no longer pending. An already completed order is never shown
+  // as pending again. (App.tsx runs the same reconciliation on foregrounding,
+  // so it also covers the screens where no order list is mounted.)
+  useEffect(() => {
+    if (orders.length > 0) {
+      reconcileAlertsWithBackend(orders);
+    }
+  }, [orders]);
+
+  /**
+   * Make this device's decision, then clean up locally. A 409 means another
+   * device already moved the order out of pending — the alert is stale, so the
+   * latest order state is fetched and the alert dismissed instead of retried.
+   * Returns false when the decision belonged to someone else.
+   */
+  const settleDecision = useCallback(
+    async (orderId: string, outcome: 'ACCEPTED' | 'REJECTED'): Promise<boolean> => {
+      try {
+        if (outcome === 'ACCEPTED') {
+          await acceptOrder(orderId);
+        } else {
+          await rejectOrder(orderId);
+        }
+        applyOrderDecision(orderId, outcome);
+        showSuccess(
+          outcome === 'ACCEPTED'
+            ? 'Order accepted successfully'
+            : 'Order rejected successfully',
+        );
+        return true;
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 409) {
+          console.log(
+            `[ORDER-ACTION] 409 — order ${orderId} already decided elsewhere`,
+          );
+          await dismissStaleAlert(orderId);
+          showError('This order was already handled on another device');
+          return false;
+        }
+        throw err;
+      }
+    },
+    [acceptOrder, rejectOrder, showSuccess, showError],
+  );
+
   // Register notification action handler (ACCEPT/REJECT from notification buttons)
   useEffect(() => {
     setNotificationActionHandler(async ({ action, orderId }) => {
       try {
-        if (action === 'ORDER_ACCEPT') {
-          console.log('[ORDER-ACTION] ACCEPT from notification');
-          await acceptOrder(orderId);
-          queryClient.invalidateQueries({ queryKey: ['orders'] });
-          showSuccess('Order accepted');
-        } else if (action === 'ORDER_REJECT') {
-          console.log('[ORDER-ACTION] REJECT from notification');
-          await rejectOrder(orderId);
-          queryClient.invalidateQueries({ queryKey: ['orders'] });
-          showSuccess('Order rejected');
-        }
+        const outcome = action === 'ORDER_ACCEPT' ? 'ACCEPTED' : 'REJECTED';
+        console.log(`[ORDER-ACTION] ${outcome} from notification`);
+        await settleDecision(orderId, outcome);
       } catch {
         // Notification actions are fire-and-forget; errors are non-critical
       }
     });
     return () => removeNotificationActionHandler();
-  }, [acceptOrder, rejectOrder, queryClient, showSuccess]);
+  }, [settleDecision]);
 
 
   // Pull-to-refresh via TanStack Query
@@ -464,14 +530,13 @@ export function OrdersScreen() {
     }),
   ).current;
 
-  // Modal actions — delegate to store + invalidate cache
+  // Modal actions — one decision path for the modal, the cards and the
+  // notification buttons, so cross-device cleanup can never be half-implemented
   const handleModalAccept = useCallback(
     async (orderId: string) => {
       try {
         console.log('[ORDER-ACTION] ACCEPT via modal');
-        await acceptOrder(orderId);
-        queryClient.invalidateQueries({ queryKey: ['orders'] });
-        showSuccess('Order accepted successfully');
+        await settleDecision(orderId, 'ACCEPTED');
       } catch (err) {
         setErrorModalMessage(
           err instanceof Error ? err.message : 'Failed to accept order',
@@ -482,7 +547,7 @@ export function OrdersScreen() {
         setPendingNewOrder(null);
       }
     },
-    [acceptOrder, queryClient, showSuccess],
+    [settleDecision],
   );
 
   const handleModalReject = useCallback(
@@ -490,9 +555,7 @@ export function OrdersScreen() {
       setRejectingId(orderId);
       try {
         console.log('[ORDER-ACTION] REJECT via modal');
-        await rejectOrder(orderId);
-        queryClient.invalidateQueries({ queryKey: ['orders'] });
-        showSuccess('Order rejected successfully');
+        await settleDecision(orderId, 'REJECTED');
       } catch (err) {
         setErrorModalMessage(
           err instanceof Error ? err.message : 'Failed to reject order',
@@ -504,7 +567,7 @@ export function OrdersScreen() {
         setPendingNewOrder(null);
       }
     },
-    [rejectOrder, queryClient, showSuccess],
+    [settleDecision],
   );
 
   const insets = useSafeAreaInsets();
@@ -635,9 +698,7 @@ export function OrdersScreen() {
                   onAccept={async orderId => {
                     setAcceptingId(orderId);
                     try {
-                      await acceptOrder(orderId);
-                      queryClient.invalidateQueries({ queryKey: ['orders'] });
-                      showSuccess('Order accepted successfully');
+                      await settleDecision(orderId, 'ACCEPTED');
                     } catch (err) {
                       setErrorModalMessage(
                         err instanceof Error ? err.message : 'Failed to accept order',
@@ -652,9 +713,7 @@ export function OrdersScreen() {
                     setRejectingId(orderId);
 
                     try {
-                      await rejectOrder(orderId);
-                      queryClient.invalidateQueries({ queryKey: ['orders'] });
-                      showSuccess('Order rejected successfully');
+                      await settleDecision(orderId, 'REJECTED');
                     } catch (err) {
                       setErrorModalMessage(
                         err instanceof Error

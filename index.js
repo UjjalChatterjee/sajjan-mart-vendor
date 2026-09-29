@@ -17,12 +17,15 @@ import {
   registerBackgroundHandler,
   registerHeadlessTask,
 } from './src/services/notification.service';
-import { syncNotificationSoundFlag } from './src/config/notificationSound';
+import { loadNotificationSoundPreference } from './src/config/notificationSound';
 
-// Publish the notification-sound switch to native storage. Runs in every JS
-// runtime start-up (main app, background message, headless task) so the
-// native-only alert path honours it.
-syncNotificationSoundFlag();
+// Pull the persisted "Notification Sound" switch (Android SharedPreferences)
+// into this JS runtime. Runs in every runtime start-up — main app, background
+// message, headless task — so the in-app audio path matches what the native
+// alert path reads directly from the same file. It never rejects: an
+// unreachable bridge leaves the default in place, and the value is re-checked
+// natively before any playback, so start-up never waits on it.
+loadNotificationSoundPreference();
 
 // Register the React app
 AppRegistry.registerComponent(appName, () => App);

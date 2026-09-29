@@ -73,7 +73,7 @@ class NativeOrderApiService : Service() {
         private const val FEEDBACK_NOTIF_ID   = 0x4F524445
     }
 
-    private enum class ApiResult { SUCCESS, AUTH_ERROR, SERVER_ERROR, NETWORK_ERROR }
+    private enum class ApiResult { SUCCESS, AUTH_ERROR, SERVER_ERROR, NETWORK_ERROR, CONFLICT }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -157,6 +157,19 @@ class NativeOrderApiService : Service() {
             ApiResult.SUCCESS -> {
                 Log.d(TAG, "[ORDER-ACTION] ✓ $actionName order $orderId confirmed by server")
                 // Notification already cancelled by NotificationActionReceiver
+                // Remember the confirmed decision so a duplicate or late
+                // NEW_ORDER push for this order can never ring again.
+                OrderDecisionStore.markResolved(applicationContext, orderId)
+            }
+            ApiResult.CONFLICT -> {
+                // 409 — another device already moved this order out of pending.
+                // The backend kept the first decision; ours is stale.
+                Log.w(TAG, "[ORDER-ACTION] 409 — order $orderId already decided on another device")
+                OrderDecisionStore.markResolved(applicationContext, orderId)
+                showFeedbackNotification(
+                    "Order Already Handled",
+                    "Order #$orderNumber was already accepted or rejected on another device.",
+                )
             }
             ApiResult.AUTH_ERROR -> {
                 // 401/403 — token may have just expired; try refresh and retry once
@@ -166,6 +179,16 @@ class NativeOrderApiService : Service() {
                     val retry = callOrderApiWithFallback(encodedId, bodyBytes, newToken)
                     if (retry == ApiResult.SUCCESS) {
                         Log.d(TAG, "[ORDER-ACTION] ✓ $actionName order $orderId — retry succeeded")
+                        OrderDecisionStore.markResolved(applicationContext, orderId)
+                        return
+                    }
+                    if (retry == ApiResult.CONFLICT) {
+                        Log.w(TAG, "[ORDER-ACTION] 409 on retry — order $orderId already decided")
+                        OrderDecisionStore.markResolved(applicationContext, orderId)
+                        showFeedbackNotification(
+                            "Order Already Handled",
+                            "Order #$orderNumber was already accepted or rejected on another device.",
+                        )
                         return
                     }
                 }
@@ -357,6 +380,9 @@ class NativeOrderApiService : Service() {
                 when (code) {
                     in 200..299 -> ApiResult.SUCCESS
                     401, 403    -> ApiResult.AUTH_ERROR
+                    // The atomic pending-exit transition answered: another device
+                    // already decided this order.
+                    409         -> ApiResult.CONFLICT
                     else        -> ApiResult.SERVER_ERROR
                 }
             } finally {

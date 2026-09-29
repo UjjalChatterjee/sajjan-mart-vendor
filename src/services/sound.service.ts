@@ -16,9 +16,13 @@
  *   Accept     →  stopOrderAlertSound()   →  playback stops
  *   Reject     →  stopOrderAlertSound()   →  playback stops
  *
- * The ENABLE_NOTIFICATION_SOUND switch in ../config/notificationSound gates
- * startOrderAlertSound() — stopOrderAlertSound() stays unconditional so a
+ * The persisted "Notification Sound" preference in ../config/notificationSound
+ * gates startOrderAlertSound() — stopOrderAlertSound() stays unconditional so a
  * mute/un-mute change can never leave audio playing.
+ *
+ * This module owns AUDIO only. The new-order haptic is fired by
+ * notification.service when a push is claimed, and is never gated by the sound
+ * preference: sound OFF means a silent alert, not an invisible one.
  */
 
 import { Platform, NativeModules } from 'react-native';
@@ -61,7 +65,7 @@ let activeOrderId: string | null = null;
 export function startOrderAlertSound(data: OrderAlertData): void {
   if (!isNotificationSoundEnabled()) {
     if (__DEV__) {
-      console.log('[SOUND] Muted by ENABLE_NOTIFICATION_SOUND — playback skipped');
+      console.log('[SOUND] Notification sound is OFF — playback skipped');
     }
     return;
   }
@@ -125,4 +129,13 @@ export function stopOrderAlertSound(): void {
  */
 export function isOrderAlertPlaying(): boolean {
   return activeOrderId !== null;
+}
+
+/**
+ * The order the foreground alert belongs to, or null when nothing started it.
+ * Lets multi-device cleanup silence only the resolved order's sound instead of
+ * whatever happens to be looping.
+ */
+export function getActiveAlertOrderId(): string | null {
+  return activeOrderId;
 }

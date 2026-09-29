@@ -18,9 +18,11 @@
  *   App killed →  HeadlessJsTask runs the JS task, which calls the API directly
  *
  * Sound:
- *   Gated by ENABLE_NOTIFICATION_SOUND in src/config/notificationSound.
- *   OrderAlertService is still started in background/killed — only its audio
- *   playback is skipped — so delivery, vibration and ACCEPT/REJECT never change.
+ *   The persisted "Notification Sound" preference (src/config/notificationSound,
+ *   stored in Android SharedPreferences) gates the alert AUDIO only. This file
+ *   fires the new-order haptic when a push is claimed, so with sound OFF the
+ *   alert still vibrates — in the foreground through vibrateOrderAlert(), in
+ *   background / killed through the notification channel's pattern.
  */
 
 import {
@@ -41,6 +43,13 @@ import {
 } from '@react-native-firebase/messaging';
 import type { RemoteMessage } from '@react-native-firebase/messaging';
 import { apiPost } from './api.client';
+import {
+  claimNewOrderAlert,
+  applyOrderDecision,
+  dismissStaleAlert,
+  resetOrderAlertState,
+  activeAlertsSnapshot,
+} from './orderAlertSync';
 
 /* ── Types ── */
 
@@ -58,6 +67,21 @@ export interface OrderNotificationData {
   paymentStatus?: string;
   items?: string; // JSON array string
 }
+
+/** FCM data payload sent when any device decides a pending order. */
+export interface OrderStatusUpdatedData {
+  type: 'ORDER_STATUS_UPDATED';
+  eventType: 'ORDER_STATUS_UPDATED';
+  eventId: string;
+  orderId: string;
+  orderNumber?: string;
+  /** ACCEPTED | REJECTED (plus any later status the backend announces). */
+  status: string;
+  decision?: string;
+}
+
+/** Event kinds this service routes. */
+export type OrderEventType = 'NEW_ORDER' | 'ORDER_STATUS_UPDATED';
 
 /** Action payload emitted by the native layer. */
 export interface NotificationActionPayload {
@@ -95,24 +119,15 @@ const processedActions = new Set<string>();
  */
 let bufferedIncomingOrder: OrderNotificationData | null = null;
 
-/** Order ids already surfaced as an alert; oldest evicted past the cap. */
-const alertedOrderIds: string[] = [];
-const ALERTED_ID_LIMIT = 50;
-
 /**
- * Claim an order id for alerting. Returns true the first time it is seen and
- * false for every repeat, so a delivery retry or a buffered replay can never
- * open a second modal or start a second alert sound for the same order.
+ * Orders already surfaced as an alert on this device live in
+ * src/services/orderAlertSync (active set + decided-order tombstones), which
+ * is also where an ORDER_STATUS_UPDATED cleanup lands. Re-exported here so the
+ * foreground push, the buffered replay, the tap and the killed-launch path all
+ * share the one guard.
  */
 export function markOrderAlerted(orderId: string | undefined | null): boolean {
-  if (!orderId) return false;
-  if (alertedOrderIds.includes(orderId)) return false;
-
-  alertedOrderIds.push(orderId);
-  if (alertedOrderIds.length > ALERTED_ID_LIMIT) {
-    alertedOrderIds.shift();
-  }
-  return true;
+  return claimNewOrderAlert(orderId);
 }
 
 /**
@@ -150,6 +165,8 @@ const NATIVE_MODULE = NativeModules.NotificationHelper as
         items: string;
       }) => void;
       stopOrderAlert: () => void;
+      /** One haptic burst for a claimed foreground alert (pattern lives in Kotlin) */
+      vibrateOrderAlert: () => void;
       getTappedOrderId: () => Promise<string | null>;
     }
   | undefined;
@@ -360,6 +377,10 @@ export async function initializeNotifications(
 export function resetNotificationInitialization(): void {
   initializedForUser = null;
   clearDeviceRegistrationRetry();
+  // A different account must not inherit this device's alert set or its
+  // decided-order tombstones (nor the reverse: signing out clears the state a
+  // re-login would otherwise suppress against).
+  resetOrderAlertState();
   if (__DEV__) {
     console.log('[FCM] Notification initialization guard reset');
   }
@@ -464,43 +485,111 @@ function startForegroundListener(): void {
   unsubscribeForeground = onMessage(m, (remoteMessage: RemoteMessage) => {
     const data = remoteMessage.data as Record<string, string> | undefined;
     if (!data) return;
+    routeOrderEventData(data, 'foreground');
+  });
+}
 
-    if (data.type !== 'NEW_ORDER') {
-      if (__DEV__) {
-        console.log('[FCM] Foreground message ignored, type:', data.type ?? 'none');
-      }
-      return;
-    }
+/**
+ * The one place that understands an order push, shared by the foreground
+ * listener, the background handler and the notification-opened path so a
+ * status cleanup can never be handled in one state and forgotten in another.
+ */
+export function routeOrderEventData(
+  data: Record<string, string>,
+  source: 'foreground' | 'background' | 'opened',
+): void {
+  const eventType = eventTypeOf(data);
 
-    const orderId = String(data.orderId ?? '');
+  if (eventType === 'ORDER_STATUS_UPDATED') {
+    handleOrderStatusUpdated(data, source);
+    return;
+  }
 
-    // The backend sends exactly one push per settled payment, but a delivery
-    // retry or a replayed buffer must not open a second modal or a second
-    // alert loop for an order that is already on screen.
-    if (!markOrderAlerted(orderId)) {
-      if (__DEV__) {
-        console.log(`[FCM] Duplicate NEW_ORDER ignored for order ${orderId}`);
-      }
-      return;
-    }
-
-    const incoming = data as unknown as OrderNotificationData;
-
-    if (onIncomingOrder) {
-      if (__DEV__) {
-        console.log(`[FCM] Foreground NEW_ORDER handled for order ${orderId}`);
-      }
-      onIncomingOrder(incoming);
-      return;
-    }
-
-    bufferedIncomingOrder = incoming;
+  if (eventType !== 'NEW_ORDER') {
     if (__DEV__) {
       console.log(
-        `[FCM] No order handler registered — buffered NEW_ORDER for order ${orderId}`,
+        `[FCM] ${source} message ignored, type:`,
+        data.type ?? data.eventType ?? 'none',
       );
     }
-  });
+    return;
+  }
+
+  const orderId = String(data.orderId ?? '');
+
+  // The backend sends exactly one push per settled payment, but a delivery
+  // retry, a replayed buffer or a second listener must not open a second modal
+  // or a second alert loop for an order already on screen — and must never
+  // re-surface an order another device already decided.
+  if (!claimNewOrderAlert(orderId, data.orderNumber)) {
+    if (__DEV__) {
+      console.log(`[FCM] ${source} NEW_ORDER ignored for order ${orderId}`);
+    }
+    return;
+  }
+
+  const incoming = data as unknown as OrderNotificationData;
+
+  if (source !== 'foreground') {
+    // No JS UI exists in the background/killed runtime; the native alert is
+    // already running and the order is recorded so the next foreground render
+    // reconciles instead of re-alerting. The notification it posted already
+    // vibrated, so this path must not buzz a second time.
+    return;
+  }
+
+  // Claimed exactly once per order, so this is one haptic per alert — a delivery
+  // retry or a replayed buffer returns at the claim above.
+  vibrateForNewOrderAlert();
+
+  if (onIncomingOrder) {
+    if (__DEV__) {
+      console.log(`[FCM] Foreground NEW_ORDER handled for order ${orderId}`);
+    }
+    onIncomingOrder(incoming);
+    return;
+  }
+
+  bufferedIncomingOrder = incoming;
+  if (__DEV__) {
+    console.log(
+      `[FCM] No order handler registered — buffered NEW_ORDER for order ${orderId}`,
+    );
+  }
+}
+
+/**
+ * Handle an ORDER_STATUS_UPDATED push — another device (or this one) decided
+ * the order, so the alert must disappear everywhere: sound stops, the pending
+ * modal closes through its subscriber, the notification is cancelled by its
+ * order-derived id and the cached row flips to the new status.
+ */
+function handleOrderStatusUpdated(
+  data: Record<string, string>,
+  source: 'foreground' | 'background' | 'opened',
+): void {
+  const orderId = String(data.orderId ?? '');
+  if (!orderId) return;
+
+  const payload = data as unknown as OrderStatusUpdatedData;
+
+  if (__DEV__) {
+    console.log(
+      `[FCM] ${source} ORDER_STATUS_UPDATED for order ${orderId} → ${
+        payload.status ?? payload.decision ?? 'unknown'
+      }`,
+    );
+  }
+
+  applyOrderDecision(orderId, payload.status ?? payload.decision);
+}
+
+/** Accepts both the new `eventType` key and the legacy `type` key. */
+function eventTypeOf(
+  data: Record<string, string>,
+): OrderEventType | null {
+  const raw = String(data.eventType ?? data.type ?? '');
+  return raw === 'NEW_ORDER' || raw === 'ORDER_STATUS_UPDATED' ? raw : null;
 }
 
 export function stopForegroundListener(): void {
@@ -558,6 +647,26 @@ export function startNativeOrderAlert(data: OrderNotificationData): void {
 export function stopNativeOrderAlert(): void {
   if (Platform.OS !== 'android' || !NATIVE_MODULE) return;
   NATIVE_MODULE.stopOrderAlert();
+}
+
+/**
+ * Fire the new-order haptic.
+ *
+ * Never checks the sound preference — sound OFF must still vibrate. It runs
+ * only for a claimed foreground push, which is the single JS vibration point:
+ * a foreground alert posts no system notification (the modal is the UI), and
+ * background / killed alerts vibrate through the notification channel instead.
+ */
+function vibrateForNewOrderAlert(): void {
+  if (Platform.OS !== 'android' || !NATIVE_MODULE?.vibrateOrderAlert) return;
+  try {
+    NATIVE_MODULE.vibrateOrderAlert();
+  } catch (error) {
+    console.warn(
+      '[FCM] New-order haptic failed:',
+      error instanceof Error ? error.message : String(error),
+    );
+  }
 }
 
 /* ──────────────────────────────────────────────────────────────────────
@@ -696,22 +805,10 @@ function startNotificationOpenedListener(): void {
         console.log('[FCM] Notification opened (background)');
       }
       const data = remoteMessage.data as Record<string, string> | undefined;
-      if (data?.type !== 'NEW_ORDER') return;
-
-      const orderId = String(data.orderId ?? '');
-      if (!markOrderAlerted(orderId)) {
-        if (__DEV__) {
-          console.log(`[FCM] Duplicate NEW_ORDER open ignored for ${orderId}`);
-        }
-        return;
-      }
-
-      const incoming = data as unknown as OrderNotificationData;
-      if (onIncomingOrder) {
-        onIncomingOrder(incoming);
-      } else {
-        bufferedIncomingOrder = incoming;
-      }
+      if (!data) return;
+      // The app is foreground now, so the open is just another delivery of the
+      // same event and goes through the shared router (dedupe included).
+      routeOrderEventData(data, 'foreground');
     },
   );
 }
@@ -738,44 +835,65 @@ export async function handleInitialNotification(): Promise<OrderNotificationData
  * Background Message Handler
  *
  * For NEW_ORDER: CustomMessagingReceiver handles this natively by starting
- * OrderAlertService directly. This handler is a no-op for NEW_ORDER to
- * prevent duplicate service starts.
+ * OrderAlertService directly (and never dispatches here). This handler is a
+ * safety net for the case where the JS runtime does receive it: it claims the
+ * order first, so an order this device already resolved never rings again.
  *
- * For other message types: future handlers can be added here.
+ * For ORDER_STATUS_UPDATED: the native receiver stops the siren and cancels the
+ * order's notification without JS; this handler runs the same cleanup through
+ * the shared alert-sync layer so the cache/modal state is right the moment the
+ * app is opened again.
  * ────────────────────────────────────────────────────────────────────── */
 
 export function registerBackgroundHandler(): void {
   const m = getMessaging();
   setBackgroundMessageHandler(m, async (remoteMessage: RemoteMessage) => {
     const data = remoteMessage.data as Record<string, string> | undefined;
+    if (!data) return;
+
     if (__DEV__) {
       console.log(
         '[FCM] Background message received, type:',
-        data?.type ?? 'unknown',
+        data.eventType ?? data.type ?? 'unknown',
       );
     }
 
-    // NEW_ORDER is handled natively by CustomMessagingReceiver.
-    // As a safety net, also start OrderAlertService from JS in case
-    // the native service missed it. OrderAlertService handles duplicates
-    // gracefully (same orderId → no duplicate sound).
-    if (
-      data?.type === 'NEW_ORDER' &&
-      Platform.OS === 'android' &&
-      NATIVE_MODULE
-    ) {
-      NATIVE_MODULE.startOrderAlert({
-        orderId: data.orderId || '',
-        orderNumber: data.orderNumber || data.orderId || '',
-        customerName: data.customerName || '',
-        customerPhone: data.customerPhone || '',
-        address: data.address || '',
-        total: data.total || '',
-        paymentMethod: data.paymentMethod || '',
-        paymentStatus: data.paymentStatus || '',
-        items: data.items || '[]',
-      });
+    const eventType = eventTypeOf(data);
+
+    if (eventType === 'NEW_ORDER') {
+      // Claim before ringing — a decided order must never start the alert.
+      const claimed = claimNewOrderAlert(data.orderId, data.orderNumber);
+      if (claimed && Platform.OS === 'android' && NATIVE_MODULE) {
+        NATIVE_MODULE.startOrderAlert({
+          orderId: data.orderId || '',
+          orderNumber: data.orderNumber || data.orderId || '',
+          customerName: data.customerName || '',
+          customerPhone: data.customerPhone || '',
+          address: data.address || '',
+          total: data.total || '',
+          paymentMethod: data.paymentMethod || '',
+          paymentStatus: data.paymentStatus || '',
+          items: data.items || '[]',
+        });
+      }
+      return;
     }
+
+    if (eventType === 'ORDER_STATUS_UPDATED') {
+      const alertsLeftAfterCleanup = activeAlertsSnapshot().some(
+        alert => alert.orderId !== String(data.orderId ?? ''),
+      );
+      routeOrderEventData(data, 'background');
+      // The service holds one global siren. Silence it when no undecided
+      // alert is left; the native receiver already stopped it when the
+      // resolved order is the one it was ringing for.
+      if (!alertsLeftAfterCleanup) {
+        stopNativeOrderAlert();
+      }
+      return;
+    }
+
+    routeOrderEventData(data, 'background');
   });
 }
 
@@ -824,8 +942,13 @@ export function registerHeadlessTask(): void {
           console.log('[ORDER-ACTION] API success — order rejected');
         }
 
-        // SUCCESS: dismiss the notification
-        dismissNotification(orderId);
+        // SUCCESS: this device holds the decision — run the full cleanup
+        // (sound, notification, cache, decided-order tombstone) so a late
+        // NEW_ORDER replay for the same order can never ring again.
+        applyOrderDecision(
+          orderId,
+          action === 'ORDER_ACCEPT' ? 'ACCEPTED' : 'REJECTED',
+        );
         console.log('[ORDER-ACTION] Notification dismissed');
       } catch (error: any) {
         // FAILURE: keep the notification visible so the user can see it
@@ -836,8 +959,18 @@ export function registerHeadlessTask(): void {
           errorMsg,
         );
 
-        // Do NOT dismiss the notification on failure — it stays visible
-        // as a persistent indicator that the action did not complete.
+        // A 409 means another device already decided it — the alert is stale,
+        // not retryable. Dismiss it instead of keeping it up. The 409's own
+        // message is free text, not a status, so the live status is read from
+        // the order list; if that read fails the alert still closes.
+        if (error?.status === 409) {
+          console.log(
+            `[ORDER-ACTION] Order ${orderId} was already decided on another device — dismissing stale alert`,
+          );
+          await dismissStaleAlert(orderId);
+        }
+        // Do NOT dismiss the notification on any other failure — it stays
+        // visible as a persistent indicator that the action did not complete.
       }
     };
   });

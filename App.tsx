@@ -5,7 +5,7 @@
  */
 
 import React, { useEffect, useRef, useState } from 'react';
-import { StatusBar, View, StyleSheet } from 'react-native';
+import { StatusBar, View, StyleSheet, AppState } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { queryClient } from './src/services/queryClient';
@@ -23,6 +23,7 @@ import {
   initializeNotifications,
   resetNotificationInitialization,
 } from './src/services/notification.service';
+import { reconcileAlertsWithBackend } from './src/services/orderAlertSync';
 
 /**
  * Screen router — decides between auth screens and the main app.
@@ -51,6 +52,23 @@ function AppContent() {
       );
     });
   }, [isAuthenticated, user?.id]);
+
+  /* Coming back to the foreground is the reconnect point for a device that was
+     offline while another device accepted or rejected an order: any alert whose
+     order is no longer pending is dropped before it can be shown again. */
+  useEffect(() => {
+    if (!isAuthenticated) {
+      return;
+    }
+    const subscription = AppState.addEventListener('change', status => {
+      if (status === 'active') {
+        reconcileAlertsWithBackend().catch(() => {
+          /* reconciliation retries on the next resume or list refresh */
+        });
+      }
+    });
+    return () => subscription.remove();
+  }, [isAuthenticated]);
 
   /* When auth drops to false (logout / token expiry), always reset nav to login */
   useEffect(() => {

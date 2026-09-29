@@ -9,6 +9,9 @@ import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.MediaPlayer
 import android.os.Build
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.facebook.react.bridge.Promise
@@ -57,10 +60,20 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
         private const val KEY_SOUND_ENABLED = "order_alert_sound_enabled"
 
         /**
-         * Read the notification-sound switch that JS publishes from
-         * src/config/notificationSound (ENABLE_NOTIFICATION_SOUND).
+         * The single new-order haptic pattern.
          *
-         * Defaults to enabled until JS writes a value, so a fresh install or a
+         * Both alert paths use it — the notification channel (background / killed)
+         * and vibrateOrderAlert() (in-app modal, where no notification is posted) —
+         * so an order alert buzzes the same way whichever path delivered it.
+         * Vibration is never gated by the sound preference.
+         */
+        val ORDER_ALERT_VIBRATION_PATTERN = longArrayOf(0, 300, 200, 300, 200, 300)
+
+        /**
+         * Read the notification-sound switch that the Settings screen persists here
+         * in SharedPreferences (see src/config/notificationSound.ts).
+         *
+         * Defaults to enabled until the user turns it off, so a fresh install or a
          * push handled before the bundle ever ran still sounds.
          */
         @JvmStatic
@@ -71,6 +84,18 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
         @Volatile
         var instance: NotificationHelperModule? = null
             private set
+
+        /**
+         * Deterministic notification ID for an order — the single source of truth
+         * shared by the JS-posted order notification and OrderAlertService's
+         * foreground notification. Because both paths use it, one notification
+         * exists per order and cancelling it can never touch another order's
+         * notification or a notification from another app.
+         */
+        @JvmStatic
+        fun notificationIdFor(orderId: String): Int {
+            return 0x7FFFFFFF and orderId.hashCode()
+        }
     }
 
     init {
@@ -101,10 +126,8 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
 
     /* ── Notification ID ── */
 
-    /** Deterministic notification ID from order string — safe for per-order dismissal. */
-    private fun notificationIdFor(orderId: String): Int {
-        return (0x7FFFFFFF and orderId.hashCode())
-    }
+    /* The deterministic id lives in the companion (notificationIdFor) so
+       OrderAlertService and the receivers resolve the same id for an order. */
 
     /* ── Build & show ── */
 
@@ -215,10 +238,12 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
     /**
      * JS call: NotificationHelper.setNotificationSoundEnabled(true | false)
      *
-     * Persists the centralized ENABLE_NOTIFICATION_SOUND switch so the
-     * native-only alert path (CustomMessagingReceiver → OrderAlertService),
-     * which runs without the JS bundle, can honour it. Affects audio only —
-     * notifications, vibration and ACCEPT/REJECT are untouched.
+     * Persists the "Notification Sound" preference. SharedPreferences is the one
+     * store for it — the Settings screen writes it here, JS reads it back through
+     * getNotificationSoundEnabled(), and the native-only alert path
+     * (CustomMessagingReceiver → OrderAlertService), which runs without the JS
+     * bundle, honours it straight from this file. Affects audio only:
+     * notifications, vibration and ACCEPT / REJECT are untouched.
      */
     @ReactMethod
     fun setNotificationSoundEnabled(enabled: Boolean) {
@@ -228,6 +253,52 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
             .putBoolean(KEY_SOUND_ENABLED, enabled)
             .apply()
         Log.d(TAG, "[ORDER-ALERT] Notification sound ${if (enabled) "enabled" else "muted"} by JS")
+    }
+
+    /**
+     * JS call: NotificationHelper.getNotificationSoundEnabled() → Promise<Boolean>
+     *
+     * The persisted value, read from the same SharedPreferences file the native
+     * alert path uses. Never a second copy, so the two runtimes cannot drift.
+     */
+    @ReactMethod
+    fun getNotificationSoundEnabled(promise: Promise) {
+        promise.resolve(isNotificationSoundEnabled(reactApplicationContext))
+    }
+
+    /**
+     * JS call: NotificationHelper.vibrateOrderAlert()
+     *
+     * One haptic burst for the in-app new-order alert. While the app is in the
+     * foreground no system notification is posted (the modal IS the UI), so the
+     * channel-level vibration never runs — this is the only vibration source for
+     * that path, which keeps exactly one buzz per alert.
+     */
+    @ReactMethod
+    fun vibrateOrderAlert() {
+        val ctx = reactApplicationContext
+        val vibrator: Vibrator? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            (ctx.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager)
+                ?.defaultVibrator
+        } else {
+            ctx.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+        }
+
+        if (vibrator == null || !vibrator.hasVibrator()) {
+            Log.d(TAG, "[ORDER-ALERT] No vibrator on this device — haptic skipped")
+            return
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            vibrator.vibrate(
+                VibrationEffect.createWaveform(ORDER_ALERT_VIBRATION_PATTERN, -1),
+            )
+        } else {
+            // API 24/25 has no VibrationEffect; the waveform overload there is the
+            // only way to reuse the shared pattern.
+            vibrator.vibrate(ORDER_ALERT_VIBRATION_PATTERN, -1)
+        }
+        Log.d(TAG, "[ORDER-ALERT] New-order haptic fired")
     }
 
     /**

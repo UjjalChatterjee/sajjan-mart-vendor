@@ -37,6 +37,14 @@ class OrderAlertService : Service() {
 
     companion object {
         private const val TAG = "OrderAlertService"
+
+        /**
+         * Legacy fixed notification id kept only so a service notification posted
+         * by an older build can still be cleared. New alerts use
+         * NotificationHelperModule.notificationIdFor(orderId) — the same id the JS
+         * path uses — so a single ORDER_STATUS_UPDATED can dismiss exactly the
+         * order it refers to.
+         */
         const val NOTIFICATION_ID = 9999
         private const val ACTION_STOP = "com.sajjanmart.ALERT_STOP"
 
@@ -103,6 +111,13 @@ class OrderAlertService : Service() {
             itemsJson: String = "[]",
             itemCount: String = "",
         ) {
+            // An order this device already decided must never ring again — this
+            // covers the status push arriving before (or instead of) the NEW_ORDER.
+            if (OrderDecisionStore.isResolved(context, orderId)) {
+                Log.d(TAG, "[ORDER-ALERT] Order $orderId already resolved — alert skipped")
+                return
+            }
+
             val intent = Intent(context, OrderAlertService::class.java).apply {
                 putExtra(EXTRA_ORDER_ID,       orderId)
                 putExtra(EXTRA_ORDER_NUMBER,   orderNumber)
@@ -121,11 +136,50 @@ class OrderAlertService : Service() {
         @Volatile
         private var instance: OrderAlertService? = null
 
+        /** The order the single live alert belongs to, for targeted dismissal from
+         *  a receiver (which has no service handle of its own). */
+        @Volatile
+        @JvmStatic
+        var activeOrderId: String? = null
+            private set
+
+        /**
+         * Resolve an order that was decided elsewhere (ORDER_STATUS_UPDATED) or
+         * by this device.
+         *
+         * Stops the looping siren only when this order owns it, then cancels
+         * exactly this order's notification id. Another order's alert is never
+         * touched, so a multi-order tray keeps its pending entries.
+         */
+        @JvmStatic
+        fun handleOrderResolved(context: Context, orderId: String) {
+            if (orderId.isBlank() || orderId == "unknown") return
+
+            val ownsAlert = activeOrderId == orderId
+            if (ownsAlert) {
+                stop(context)
+            }
+
+            try {
+                val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                nm.cancel(NotificationHelperModule.notificationIdFor(orderId))
+                if (ownsAlert) {
+                    // Only ours: never cancel another app's or another alert's entry.
+                    nm.cancel(NOTIFICATION_ID)
+                }
+                Log.d(TAG, "[ORDER-ALERT] Resolved order $orderId (ownsAlert=$ownsAlert)")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to cancel notification for resolved order $orderId", e)
+            }
+        }
+
         /** Stop the order alert service and release audio immediately.
          *  Safe to call multiple times from any thread or receiver. */
+        @JvmStatic
         fun stop(context: Context) {
             // Immediate in-memory stop for 0ms latency on ACCEPT/REJECT
             instance?.stopPlayback()
+            activeOrderId = null
 
             try {
                 val stopIntent = Intent(context, OrderAlertService::class.java).apply {
@@ -196,7 +250,9 @@ class OrderAlertService : Service() {
                     ).apply {
                         description = "URGENT order alerts — plays loud alarm until accepted or rejected"
                         enableVibration(true)
-                        vibrationPattern = longArrayOf(0, 300, 200, 300, 200, 300)
+                        // Shared pattern — the in-app alert vibrates with this same
+                        // array, so every new-order alert buzzes identically.
+                        vibrationPattern = NotificationHelperModule.ORDER_ALERT_VIBRATION_PATTERN
                         enableLights(true)
                         lightColor = 0xFF16A34A.toInt()
                         lockscreenVisibility = Notification.VISIBILITY_PUBLIC
@@ -278,32 +334,30 @@ class OrderAlertService : Service() {
         Log.d(TAG, "[ORDER-ALERT] starting for order: $orderId")
 
         try {
+            // Same deterministic id the JS layer uses for this order, so both
+            // paths post ONE notification per order instead of duplicating it —
+            // and dismissing one order's alert can never hit another's.
+            val notifId = NotificationHelperModule.notificationIdFor(orderId)
+            activeOrderId = orderId
+
             val notification = buildForegroundNotification(
                 orderId, orderNumber, customerName, customerPhone,
                 address, total, paymentMethod, paymentStatus, itemsJson, itemCount,
             )
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 startForeground(
-                    NOTIFICATION_ID,
+                    notifId,
                     notification,
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
                 )
             } else {
-                startForeground(NOTIFICATION_ID, notification)
+                startForeground(notifId, notification)
             }
-            Log.d(TAG, "[ORDER-ALERT] notification created")
+            Log.d(TAG, "[ORDER-ALERT] notification created (id=$notifId)")
             startPlayback()
-
-            // Ensure any duplicate default Firebase notification is cancelled immediately and after slight delays
-            CustomMessagingReceiver.suppressDuplicateNotifications(this)
-            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                CustomMessagingReceiver.suppressDuplicateNotifications(this@OrderAlertService)
-            }, 500)
-            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                CustomMessagingReceiver.suppressDuplicateNotifications(this@OrderAlertService)
-            }, 1500)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start foreground service or playback", e)
+            activeOrderId = null
             stopSelf()
             return START_NOT_STICKY
         }
@@ -317,9 +371,9 @@ class OrderAlertService : Service() {
             instance = null
         }
         stopPlayback()
-        // DETACH — keep notification visible so the user can see what happened
-        // even after the service exits. JS task or NativeOrderApiService will
-        // call cancelAll() on success.
+        // DETACH — keep the notification visible so the user can see what happened
+        // even after the service exits. It carries this order's deterministic id,
+        // so the app (or a later ORDER_STATUS_UPDATED) can cancel exactly it.
         try { stopForeground(STOP_FOREGROUND_DETACH) } catch (_: Exception) {}
         restoreStreamVolume()
         releaseAudioFocus()
@@ -635,6 +689,11 @@ class OrderAlertService : Service() {
             // Behaviour
             .setOngoing(true)        // swipe-away blocked while service is alive
             .setAutoCancel(false)
+            // One buzz per order. The same order id resolves to the same
+            // notification id, and both the native receiver and the JS runtime
+            // can post it — without this flag each re-post would re-run the
+            // channel vibration. The first post still alerts; updates are quiet.
+            .setOnlyAlertOnce(true)
             .setLocalOnly(true)      // don't forward to Wear OS
             .setNumber(itemCount)    // badge count
             .setSound(null)          // audio managed by MediaPlayer (USAGE_ALARM)
