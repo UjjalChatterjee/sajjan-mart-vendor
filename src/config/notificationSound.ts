@@ -20,7 +20,7 @@
 import { NativeModules, Platform } from 'react-native';
 
 /** Switch the new-order notification sound ON or OFF here. */
-const ENABLE_NOTIFICATION_SOUND: boolean = false;
+const ENABLE_NOTIFICATION_SOUND: boolean = true;
 
 /** Whether the order-alert sound is currently allowed to play. */
 export function isNotificationSoundEnabled(): boolean {
