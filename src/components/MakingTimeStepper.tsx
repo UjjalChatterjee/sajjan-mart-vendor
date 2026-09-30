@@ -19,31 +19,31 @@ interface MakingTimeStepperProps {
  */
 export function MakingTimeStepper({ value, onChange }: MakingTimeStepperProps) {
   const step = (delta: number) => onChange(clampPreparationMinutes(value + delta));
+  const atFloor = value <= PREP_MIN_MINUTES;
+  const atCeiling = value >= PREP_MAX_MINUTES;
 
   return (
-    <View style={s.row}>
+    <View style={s.container}>
       <Text style={s.label}>Making Time</Text>
-      <View style={s.stepper}>
+      <View style={s.controls}>
         <Pressable
           testID="prep-minus"
-          style={[s.stepBtn, value <= PREP_MIN_MINUTES && s.stepBtnDisabled]}
-          disabled={value <= PREP_MIN_MINUTES}
+          style={[s.stepBtn, atFloor && s.stepBtnDisabled]}
+          disabled={atFloor}
           onPress={() => step(-1)}>
-          <Text style={[s.stepText, value <= PREP_MIN_MINUTES && s.stepTextDisabled]}>
-            −
-          </Text>
+          <Text style={[s.stepText, atFloor && s.stepTextDisabled]}>−</Text>
         </Pressable>
-        <Text style={s.value} testID="prep-minutes">
-          {value} min
-        </Text>
+        <View style={s.valuePill}>
+          <Text style={s.value} testID="prep-minutes">
+            {value} min
+          </Text>
+        </View>
         <Pressable
           testID="prep-plus"
-          style={[s.stepBtn, value >= PREP_MAX_MINUTES && s.stepBtnDisabled]}
-          disabled={value >= PREP_MAX_MINUTES}
+          style={[s.stepBtn, atCeiling && s.stepBtnDisabled]}
+          disabled={atCeiling}
           onPress={() => step(1)}>
-          <Text style={[s.stepText, value >= PREP_MAX_MINUTES && s.stepTextDisabled]}>
-            +
-          </Text>
+          <Text style={[s.stepText, atCeiling && s.stepTextDisabled]}>+</Text>
         </Pressable>
       </View>
     </View>
@@ -51,27 +51,36 @@ export function MakingTimeStepper({ value, onChange }: MakingTimeStepperProps) {
 }
 
 const s = StyleSheet.create({
-  row: {
-    flexDirection: 'row',
+  container: {
+    width: '100%',
     alignItems: 'center',
-    justifyContent: 'space-between',
-    marginBottom: 18,
-    paddingHorizontal: 2,
+    backgroundColor: Colors.primaryTintSoft,
+    borderWidth: 1,
+    borderColor: Colors.primaryTint,
+    borderRadius: 18,
+    paddingTop: 12,
+    paddingBottom: 14,
+    paddingHorizontal: 14,
+    marginBottom: 16,
   },
   label: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: Colors.gray700,
+    fontSize: 12,
+    fontWeight: '700',
+    color: Colors.primaryDark,
+    letterSpacing: 1.2,
+    textTransform: 'uppercase',
+    marginBottom: 10,
   },
-  stepper: {
+  controls: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 6,
+    justifyContent: 'center',
+    gap: 10,
   },
   stepBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 12,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
     borderWidth: 1.5,
     borderColor: Colors.primary,
     alignItems: 'center',
@@ -91,12 +100,20 @@ const s = StyleSheet.create({
   stepTextDisabled: {
     color: Colors.gray400,
   },
+  valuePill: {
+    minWidth: 96,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: Colors.primaryTint,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 12,
+  },
   value: {
-    minWidth: 64,
-    textAlign: 'center',
-    fontSize: 15,
-    fontWeight: '700',
+    fontSize: 16,
+    fontWeight: '800',
     color: Colors.gray900,
+    textAlign: 'center',
     fontVariant: ['tabular-nums'],
   },
 });

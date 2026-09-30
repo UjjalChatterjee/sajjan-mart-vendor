@@ -36,7 +36,7 @@ function formatCurrency(amount: number): string {
 }
 
 /* ──────────────────────────────────────────────────────────────────────
- * Pulsing order icon
+ * Pulsing order icon — the header's attention cue
  * ────────────────────────────────────────────────────────────────────── */
 
 function PulsingIcon() {
@@ -46,7 +46,7 @@ function PulsingIcon() {
     const pulse = Animated.loop(
       Animated.sequence([
         Animated.timing(pulseAnim, {
-          toValue: 1.1,
+          toValue: 1.12,
           duration: 900,
           useNativeDriver: true,
         }),
@@ -78,7 +78,7 @@ function PulsingIcon() {
  * ────────────────────────────────────────────────────────────────────── */
 
 function AnimatedLabel() {
-  const opacityAnim = useRef(new Animated.Value(0.5)).current;
+  const opacityAnim = useRef(new Animated.Value(0.6)).current;
 
   useEffect(() => {
     const attention = Animated.loop(
@@ -89,7 +89,7 @@ function AnimatedLabel() {
           useNativeDriver: true,
         }),
         Animated.timing(opacityAnim, {
-          toValue: 0.6,
+          toValue: 0.65,
           duration: 600,
           useNativeDriver: true,
         }),
@@ -130,15 +130,9 @@ interface NewOrderAlertModalProps {
  * stepper and both funnel into one settleDecision path in OrdersScreen.
  * Cannot be dismissed by tapping outside, swiping, or auto-timer.
  *
- * Shows complete order details:
- *   - Order number
- *   - Customer name
- *   - Customer phone
- *   - Address
- *   - All items with quantity and price
- *   - Total
- *   - Payment method
- *   - Payment status
+ * Three zones: a fixed header, a scrollable body (customer, items, amount),
+ * and a fixed footer (Making Time + the two decisions) so the vendor can
+ * always reach the controls on a small screen.
  * ────────────────────────────────────────────────────────────────────── */
 
 export function NewOrderAlertModal({
@@ -203,14 +197,10 @@ export function NewOrderAlertModal({
     onReject(order.id);
   };
 
-  const previewItems = order.items.slice(0, 5);
-  const extraCount = order.items.length - 5;
-
-  // Build payment display string
-  const paymentParts: string[] = [];
-  if (order.paymentMethod) paymentParts.push(order.paymentMethod);
-  if (order.paymentStatus) paymentParts.push(order.paymentStatus);
-  const paymentDisplay = paymentParts.join(' · ');
+  // One badge per part that exists: a method without a status is not a gap.
+  const paymentBadges: string[] = [];
+  if (order.paymentMethod) paymentBadges.push(order.paymentMethod);
+  if (order.paymentStatus) paymentBadges.push(order.paymentStatus);
 
   return (
     <Modal
@@ -227,88 +217,97 @@ export function NewOrderAlertModal({
               transform: [{ scale: scaleAnim }],
             },
           ]}>
+          {/* ── Header ── */}
+          <View style={s.header}>
+            <PulsingIcon />
+            <View style={s.headerText}>
+              <AnimatedLabel />
+              <Text style={s.orderId} numberOfLines={1}>
+                Order #{order.orderNumber || order.id}
+              </Text>
+              <Text style={s.itemCount}>
+                {order.items.length} item{order.items.length === 1 ? '' : 's'}
+              </Text>
+            </View>
+          </View>
+          <View style={s.divider} />
+
+          {/* ── Body: scrolls when the order is long ── */}
           <ScrollView
-            style={s.modalScroll}
-            contentContainerStyle={s.modalScrollContent}
+            style={s.scroll}
+            contentContainerStyle={s.body}
             showsVerticalScrollIndicator={false}
             bounces={false}>
-            {/* ── Icon ── */}
-            <PulsingIcon />
-
-            {/* ── NEW ORDER ── */}
-            <AnimatedLabel />
-            <Text style={s.orderId}>Order #{order.orderNumber || order.id}</Text>
-
-            {/* ── Divider ── */}
-            <View style={s.divider} />
-
-            {/* ── Customer Info ── */}
             <Text style={s.customerName}>{order.customerName}</Text>
             {order.customerPhone ? (
               <Text style={s.customerDetail}>📞 {order.customerPhone}</Text>
             ) : null}
             {order.deliveryAddress ? (
-              <Text style={s.customerDetail} numberOfLines={2}>
-                📍 {order.deliveryAddress}
-              </Text>
+              <Text style={s.customerDetail}>📍 {order.deliveryAddress}</Text>
             ) : null}
             <Text style={s.time}>Received at {formatTime(order.createdAt)}</Text>
 
-            {/* ── Items ── */}
             <View style={s.itemList}>
               <Text style={s.itemListHeader}>
                 Items ({order.items.length})
               </Text>
-              {previewItems.map(item => (
+              {order.items.map(item => (
                 <View key={item.id} style={s.itemRow}>
-                  <Text style={s.itemName} numberOfLines={1}>
+                  <Text style={s.itemName} numberOfLines={2}>
                     {item.name}
                   </Text>
                   <Text style={s.itemQty}>× {item.quantity}</Text>
                   <Text style={s.itemPrice}>
-                    {item.price > 0 ? formatCurrency(item.total || item.price * item.quantity) : ''}
+                    {item.price > 0
+                      ? formatCurrency(item.total || item.price * item.quantity)
+                      : '—'}
                   </Text>
                 </View>
               ))}
-              {extraCount > 0 && (
-                <Text style={s.moreItems}>
-                  + {extraCount} more item{extraCount !== 1 ? 's' : ''}
-                </Text>
-              )}
             </View>
 
-            {/* ── Total ── */}
-            <Text style={s.total}>{formatCurrency(order.grandTotal)}</Text>
+            <View style={s.amountRow}>
+              <Text style={s.amountLabel}>Total</Text>
+              <Text style={s.total}>{formatCurrency(order.grandTotal)}</Text>
+            </View>
 
-            {/* ── Payment Info ── */}
-            {paymentDisplay ? (
-              <Text style={s.paymentInfo}>💳 {paymentDisplay}</Text>
+            {paymentBadges.length > 0 ? (
+              <View style={s.paymentRow}>
+                {paymentBadges.map((label, index) => (
+                  <View key={`${label}-${index}`} style={s.paymentBadge}>
+                    <Text style={s.paymentBadgeText}>{label}</Text>
+                  </View>
+                ))}
+              </View>
             ) : null}
+          </ScrollView>
 
-            {/* ── Making time — food orders only ── */}
+          {/* ── Footer: making time and both decisions stay on screen ── */}
+          <View style={s.footer}>
             {isFood ? (
               <MakingTimeStepper
                 value={preparationMinutes}
                 onChange={setPreparationMinutes}
               />
             ) : null}
-
-            {/* ── Actions ── */}
             <View style={s.actions}>
               <Pressable
-                style={s.rejectBtn}
+                style={({ pressed }) => [
+                  s.rejectBtn,
+                  pressed && s.rejectBtnPressed,
+                ]}
                 onPress={handleReject}
                 android_ripple={{ color: Colors.dangerLight }}>
                 <Text style={s.rejectText}>Reject</Text>
               </Pressable>
               <Pressable
-                style={s.acceptBtn}
+                style={({ pressed }) => [s.acceptBtn, pressed && s.acceptBtnPressed]}
                 onPress={handleAccept}
                 android_ripple={{ color: Colors.primaryDark }}>
                 <Text style={s.acceptText}>Accept</Text>
               </Pressable>
             </View>
-          </ScrollView>
+          </View>
         </Animated.View>
       </Animated.View>
     </Modal>
@@ -324,193 +323,233 @@ const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 const s = StyleSheet.create({
   overlay: {
     flex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.4)',
+    backgroundColor: Colors.overlay,
     justifyContent: 'center',
     alignItems: 'center',
-    paddingHorizontal: 20,
+    paddingHorizontal: 18,
+    // Keeps the capped modal clear of the status and navigation bars.
+    paddingVertical: 24,
   },
   modal: {
     width: '100%',
-    maxWidth: SCREEN_WIDTH * 0.9,
-    maxHeight: SCREEN_HEIGHT * 0.8,
+    maxWidth: Math.min(SCREEN_WIDTH * 0.94, 430),
+    maxHeight: SCREEN_HEIGHT * 0.82,
     backgroundColor: Colors.white,
-    borderRadius: 26,
+    borderRadius: 24,
     borderWidth: 1,
-    borderColor: '#E5E7EB',
+    borderColor: Colors.gray200,
     overflow: 'hidden',
     shadowColor: '#000',
-    shadowOffset: { width: 0, height: 6 },
-    shadowOpacity: 0.1,
-    shadowRadius: 16,
-    elevation: 6,
-  },
-  modalScroll: {
-    flexGrow: 0,
-  },
-  modalScrollContent: {
-    paddingTop: 28,
-    paddingBottom: 24,
-    paddingHorizontal: 24,
-    alignItems: 'center',
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.14,
+    shadowRadius: 20,
+    elevation: 8,
   },
 
-  /* Icon */
+  /* Header */
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingTop: 18,
+    paddingBottom: 14,
+    paddingHorizontal: 18,
+  },
   iconOuter: {
-    width: 68,
-    height: 68,
+    width: 46,
+    height: 46,
     alignItems: 'center',
     justifyContent: 'center',
-    marginBottom: 14,
   },
   pulseRing: {
     position: 'absolute',
-    width: 68,
-    height: 68,
-    borderRadius: 34,
-    backgroundColor: 'rgba(34, 197, 94, 0.1)',
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    backgroundColor: Colors.blobGreen1,
   },
   iconInner: {
-    width: 52,
-    height: 52,
-    borderRadius: 26,
-    backgroundColor: Colors.primary,
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    backgroundColor: Colors.primaryTint,
     alignItems: 'center',
     justifyContent: 'center',
-    shadowColor: Colors.primary,
-    shadowOffset: { width: 0, height: 3 },
-    shadowOpacity: 0.22,
-    shadowRadius: 6,
-    elevation: 4,
   },
   iconEmoji: {
-    fontSize: 24,
+    fontSize: 21,
   },
-
-  /* Labels */
+  headerText: {
+    flex: 1,
+    minWidth: 0,
+  },
   label: {
-    fontSize: 12,
-    fontWeight: '700',
+    fontSize: 11,
+    fontWeight: '800',
     color: Colors.primary,
-    letterSpacing: 2.5,
-    marginBottom: 6,
+    letterSpacing: 1.8,
+    marginBottom: 1,
   },
   orderId: {
-    fontSize: 18,
-    fontWeight: '700',
+    fontSize: 17,
+    fontWeight: '800',
     color: Colors.gray900,
-    marginBottom: 16,
+  },
+  itemCount: {
+    fontSize: 12,
+    color: Colors.gray500,
+    marginTop: 1,
   },
 
   /* Divider */
   divider: {
-    width: '100%',
     height: 1,
-    backgroundColor: '#F3F4F6',
-    marginBottom: 16,
+    backgroundColor: Colors.gray100,
+  },
+
+  /* Scrollable body */
+  scroll: {
+    flexGrow: 0,
+    flexShrink: 1,
+  },
+  body: {
+    paddingHorizontal: 18,
+    paddingTop: 14,
+    paddingBottom: 14,
   },
 
   /* Customer */
   customerName: {
-    fontSize: 17,
-    fontWeight: '700',
+    fontSize: 16,
+    fontWeight: '800',
     color: Colors.gray900,
-    marginBottom: 4,
+    marginBottom: 3,
   },
   customerDetail: {
     fontSize: 13,
     color: Colors.gray600,
-    marginBottom: 2,
-  },
-  meta: {
-    fontSize: 14,
-    color: Colors.gray500,
-    marginBottom: 2,
+    marginBottom: 3,
+    lineHeight: 18,
   },
   time: {
-    fontSize: 13,
+    fontSize: 12,
     color: Colors.gray400,
-    marginBottom: 16,
+    marginBottom: 12,
   },
 
   /* Items */
   itemList: {
     width: '100%',
-    backgroundColor: '#F9FAFB',
+    backgroundColor: Colors.gray50,
     borderRadius: 14,
-    padding: 14,
-    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: Colors.gray100,
+    paddingTop: 12,
+    paddingBottom: 8,
+    paddingHorizontal: 12,
+    marginBottom: 12,
   },
   itemListHeader: {
-    fontSize: 13,
-    fontWeight: '600',
+    fontSize: 12,
+    fontWeight: '700',
     color: Colors.gray500,
-    marginBottom: 8,
+    letterSpacing: 0.4,
+    marginBottom: 6,
   },
   itemRow: {
     flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingVertical: 4,
+    alignItems: 'flex-start',
+    paddingVertical: 6,
   },
   itemName: {
     flex: 1,
+    minWidth: 0,
     fontSize: 14,
     color: Colors.gray700,
-    marginRight: 10,
+    marginRight: 8,
+    lineHeight: 19,
   },
   itemQty: {
     fontSize: 13,
     color: Colors.gray500,
-    fontWeight: '500',
-    marginRight: 12,
+    fontWeight: '600',
+    minWidth: 30,
+    textAlign: 'right',
+    marginRight: 10,
   },
   itemPrice: {
     fontSize: 13,
-    color: Colors.gray700,
-    fontWeight: '600',
-    minWidth: 60,
+    color: Colors.gray800,
+    fontWeight: '700',
+    minWidth: 62,
     textAlign: 'right',
-  },
-  moreItems: {
-    fontSize: 13,
-    color: Colors.gray400,
-    marginTop: 4,
+    fontVariant: ['tabular-nums'],
   },
 
-  /* Total */
+  /* Amount + payment */
+  amountRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  amountLabel: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: Colors.gray500,
+    letterSpacing: 0.4,
+    textTransform: 'uppercase',
+  },
   total: {
-    fontSize: 28,
+    fontSize: 22,
     fontWeight: '800',
     color: Colors.primary,
-    marginBottom: 6,
+    fontVariant: ['tabular-nums'],
+  },
+  paymentRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+  },
+  paymentBadge: {
+    backgroundColor: Colors.primaryTint,
+    borderRadius: 8,
+    paddingHorizontal: 9,
+    paddingVertical: 4,
+  },
+  paymentBadgeText: {
+    fontSize: 11.5,
+    fontWeight: '700',
+    color: Colors.primaryDark,
+    letterSpacing: 0.3,
   },
 
-  /* Payment */
-  paymentInfo: {
-    fontSize: 13,
-    color: Colors.gray500,
-    marginBottom: 18,
+  /* Footer — making time and the two decisions, never scrolled away */
+  footer: {
+    paddingHorizontal: 18,
+    paddingTop: 14,
+    paddingBottom: 18,
+    borderTopWidth: 1,
+    borderTopColor: Colors.gray100,
+    backgroundColor: Colors.white,
   },
-
-  /* Preparation time stepper lives in MakingTimeStepper so the order card and
-     this popup show identical controls. */
-
-  /* Actions */
   actions: {
     flexDirection: 'row',
     gap: 12,
     width: '100%',
-    marginTop: 4,
   },
   rejectBtn: {
     flex: 1,
-    height: 54,
+    height: 52,
     borderRadius: 14,
     borderWidth: 1.5,
-    borderColor: '#FCA5A5',
+    borderColor: Colors.dangerMuted,
     backgroundColor: Colors.white,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  rejectBtnPressed: {
+    backgroundColor: Colors.dangerLight,
   },
   rejectText: {
     fontSize: 15,
@@ -519,17 +558,15 @@ const s = StyleSheet.create({
     letterSpacing: 0.4,
   },
   acceptBtn: {
-    flex: 1.3,
-    height: 54,
+    flex: 1,
+    height: 52,
     borderRadius: 14,
     backgroundColor: Colors.primary,
     alignItems: 'center',
     justifyContent: 'center',
-    shadowColor: Colors.primary,
-    shadowOffset: { width: 0, height: 3 },
-    shadowOpacity: 0.22,
-    shadowRadius: 6,
-    elevation: 4,
+  },
+  acceptBtnPressed: {
+    backgroundColor: Colors.primaryDark,
   },
   acceptText: {
     fontSize: 15,

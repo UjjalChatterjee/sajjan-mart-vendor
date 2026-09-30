@@ -1705,3 +1705,130 @@ describe('Phase 9 — lateness and duration keep their seconds', () => {
     expect(sentenceOf(order)).toBe('Prepared in 4 min · Late by 3 min');
   });
 });
+
+/* ── Phase 10 — the redesigned popup ────────────────────────────────────
+ *
+ * The redesign moved content around: every item is listed instead of five plus
+ * a "+N more" note, payment reads as its own badges, and Making Time with both
+ * decisions sits in a footer outside the scroll. None of that may change what a
+ * decision sends, so these tests pin the render contract the taps depend on.
+ */
+
+/** Walk up from a host label to the control that owns its `onPress`. */
+function stepLabeled(tree: ReturnType<typeof create>, label: string) {
+  const node = tree.root.findAll(
+    n =>
+      typeof n.type === 'string' &&
+      n.children.flat().map(String).join('') === label,
+  )[0];
+  if (!node) return undefined;
+  let current: typeof node.parent = node.parent;
+  while (current && typeof current.props?.onPress !== 'function') {
+    current = current.parent;
+  }
+  return current;
+}
+
+async function mountPopup(order: Order, onAccept: jest.Mock, onReject: jest.Mock) {
+  let tree!: ReturnType<typeof create>;
+  await act(async () => {
+    tree = track(
+      create(
+        <NewOrderAlertModal
+          visible
+          order={order}
+          onAccept={onAccept}
+          onReject={onReject}
+        />,
+      ),
+    );
+  });
+  await act(async () => {});
+  return tree;
+}
+
+describe('the redesigned alert popup', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('U1 — a many-product order lists every item, and the controls stay after it', async () => {
+    const items = Array.from({ length: 7 }, (_, index) => ({
+      id: `i${index}`,
+      name: `Item ${index + 1}`,
+      quantity: index + 1,
+      price: 100,
+      total: 100 * (index + 1),
+      ready: false,
+      cancelled: false,
+      itemType: 'food',
+    }));
+    const tree = await mountModal(foodOrder({ items }));
+    const texts = hostTexts(tree);
+
+    expect(texts).toContain('Items (7)');
+    for (let index = 1; index <= 7; index += 1) {
+      expect(texts).toContain(`Item ${index}`);
+    }
+    // Nothing is folded away behind a note any more — the body scrolls instead.
+    expect(texts.some(t => t.includes('more item'))).toBe(false);
+    // The footer still comes after the list, so Making Time is above the tap.
+    expect(texts.indexOf('Item 7')).toBeLessThan(texts.indexOf('Making Time'));
+    expect(texts.indexOf('Making Time')).toBeLessThan(texts.indexOf('Accept'));
+  });
+
+  it('U2 — payment reads as its own values, and no payment paints no badge', async () => {
+    const paid = hostTexts(
+      await mountModal(foodOrder({ paymentMethod: 'UPI', paymentStatus: 'Paid' })),
+    );
+    expect(paid).toContain('UPI');
+    expect(paid).toContain('Paid');
+    expect(paid).not.toContain('UPI · Paid');
+
+    const bare = hostTexts(
+      await mountModal(foodOrder({ paymentMethod: undefined, paymentStatus: undefined })),
+    );
+    expect(bare).not.toContain('UPI');
+    expect(bare).toContain('₹250');
+    expect(bare).toContain('Making Time');
+    expect(bare).toContain('Accept');
+  });
+
+  it('U3 — the header names the order and the body keeps the received time', async () => {
+    const texts = hostTexts(await mountModal(foodOrder({ orderNumber: '1042' })));
+
+    expect(texts).toContain('NEW ORDER');
+    expect(texts).toContain('Order #1042');
+    expect(texts).toContain('Test Customer');
+    expect(texts).toContain('📞 9999999999');
+    expect(texts.some(t => t.startsWith('Received at'))).toBe(true);
+  });
+
+  it('U4 — Reject still silences the alert and passes only the order id', async () => {
+    const onReject = jest.fn();
+    const tree = await mountPopup(foodOrder(), jest.fn(), onReject);
+
+    await act(async () => {
+      stepLabeled(tree, 'Reject')!.props.onPress();
+    });
+
+    expect(onReject).toHaveBeenCalledWith('order-1');
+    expect(mockStopOrderAlertSound).toHaveBeenCalled();
+    // A redesign of the popup must not decide anything by itself.
+    expect(mockApiPut).not.toHaveBeenCalled();
+  });
+
+  it('U5 — Accept after stepping sends the selection, from the footer', async () => {
+    const onAccept = jest.fn();
+    const tree = await mountPopup(foodOrder(), onAccept, jest.fn());
+
+    await press(tree, 'prep-minus', 4);
+    expect(stepperValue(tree)).toBe(minutes(26));
+    await act(async () => {
+      stepLabeled(tree, 'Accept')!.props.onPress();
+    });
+
+    expect(onAccept).toHaveBeenCalledWith('order-1', 26);
+    expect(mockApiPut).not.toHaveBeenCalled();
+  });
+});
