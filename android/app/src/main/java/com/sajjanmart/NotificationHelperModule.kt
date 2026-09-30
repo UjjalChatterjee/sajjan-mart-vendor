@@ -1,20 +1,13 @@
 package com.sajjanmart
 
 import android.app.NotificationManager
-import android.app.PendingIntent
 import android.content.Context
-import android.content.Intent
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.MediaPlayer
 import android.os.Build
-import android.os.VibrationEffect
-import android.os.VibrationAttributes
-import android.os.Vibrator
-import android.os.VibratorManager
 import android.util.Log
-import androidx.core.app.NotificationCompat
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
@@ -26,10 +19,14 @@ import com.facebook.react.modules.core.DeviceEventManagerModule
  * Native module exposed to JS as "NotificationHelper".
  *
  * Responsibilities:
- *   - Build and display Android notifications with ACCEPT / REJECT action buttons
- *   - Dismiss a notification by its deterministic ID
+ *   - Start / stop the repeating new-order haptic (OrderVibration)
  *   - Start / stop the foreground order alert service (loops alert.mp3)
- *   - Emit action events back to JS when the app is alive
+ *   - Dismiss a notification by its deterministic ID
+ *   - Emit action / tap events back to JS when the app is alive
+ *
+ * The killed / background order alert notification is deliberately generic
+ * (see OrderAlertService), so this module exposes no order-detail notification
+ * builder any more.
  */
 class NotificationHelperModule(reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
@@ -57,16 +54,22 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
         const val EXTRA_ORDER_ID = "order_id"
         const val EXTRA_ACTION = "order_action"
 
+        /**
+         * Carried by the generic order-alert notification's tap intent. It says
+         * only "open the Orders screen" — no order id, and therefore nothing
+         * sensitive in the notification's PendingIntent either.
+         */
+        const val EXTRA_OPEN_ORDERS = "open_orders"
+
         private const val PREFS_NAME = "sajjanmart_notifications"
         private const val KEY_SOUND_ENABLED = "order_alert_sound_enabled"
 
         /**
-         * The single new-order haptic pattern.
+         * The notification channel's one-shot buzz pattern.
          *
-         * Both alert paths use it — the notification channel (background / killed)
-         * and vibrateOrderAlert() (in-app modal, where no notification is posted) —
-         * so an order alert buzzes the same way whichever path delivered it.
-         * Vibration is never gated by the sound preference.
+         * A channel can only vibrate once per post — it cannot loop — so this is
+         * NOT the repeating alert. The repeating haptic lives in
+         * [OrderVibration.LOOP_PATTERN] and is the single owner of the motor.
          */
         val ORDER_ALERT_VIBRATION_PATTERN = longArrayOf(0, 300, 200, 300, 200, 300)
 
@@ -88,27 +91,18 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
 
         /**
          * Deterministic notification ID for an order — the single source of truth
-         * shared by the JS-posted order notification and OrderAlertService's
-         * foreground notification. Because both paths use it, one notification
-         * exists per order and cancelling it can never touch another order's
-         * notification or a notification from another app.
+         * shared by OrderAlertService and the JS cleanup path. Because both use it,
+         * cancelling one order's alert can never touch another order's notification
+         * or a notification from another app.
+         *
+         * The live alert posts the generic service notification instead (it names
+         * no order), so this id now exists to clear entries an older build left
+         * behind and to keep per-order dismissal exact.
          */
         @JvmStatic
         fun notificationIdFor(orderId: String): Int {
             return 0x7FFFFFFF and orderId.hashCode()
         }
-
-        /**
-         * PendingIntent request code for one order's ACCEPT / REJECT button.
-         *
-         * Mixing with multiplication, not `or`: `orderId.hashCode() or 0x10000`
-         * left two orders whose hashes differed only inside those bits with the
-         * SAME code, and with FLAG_UPDATE_CURRENT the second notification
-         * silently rewrote the first button's target order.
-         */
-        @JvmStatic
-        fun actionRequestCode(orderId: String, action: String): Int =
-            0x7FFFFFFF and (31 * orderId.hashCode() + if (action == ACTION_REJECT) 7919 else 104729)
     }
 
     init {
@@ -124,113 +118,10 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
 
     override fun getName(): String = MODULE_NAME
 
-    /* ── Channel ── */
-
-    /**
-     * Delegate channel creation to OrderAlertService.ensureNotificationChannel()
-     * — the single source of truth for the urgent order-alert channel.
-     * Creating the channel from two places with different configs would be
-     * unpredictable: whichever runs first wins and the second is ignored.
-     */
-    private fun ensureChannel(): String {
-        OrderAlertService.ensureNotificationChannel(reactApplicationContext)
-        return CHANNEL_ID
-    }
-
     /* ── Notification ID ── */
 
     /* The deterministic id lives in the companion (notificationIdFor) so
        OrderAlertService and the receivers resolve the same id for an order. */
-
-    /* ── Build & show ── */
-
-    /**
-     * Show a notification with ACCEPT / REJECT action buttons.
-     *
-     * JS call:
-     *   NotificationHelper.showOrderNotification({
-     *     orderId, customerName, itemCount, total
-     *   })
-     */
-    @ReactMethod
-    fun showOrderNotification(data: ReadableMap) {
-        try {
-            val ctx = reactApplicationContext
-            val orderId = data.getString("orderId") ?: return
-            val orderNumber = data.getString("orderNumber") ?: orderId
-            val customerName = data.getString("customerName") ?: "Customer"
-            val customerPhone = data.getString("customerPhone") ?: ""
-            val itemCount = data.getString("itemCount") ?: "?"
-            val total = data.getString("total") ?: "0"
-            val paymentMethod = data.getString("paymentMethod") ?: ""
-            val address = data.getString("address") ?: ""
-
-            val channelId = ensureChannel()
-            val notifId = notificationIdFor(orderId)
-
-            // ── PendingIntents for actions ──
-            val acceptIntent = createActionIntent(ctx, ACTION_ACCEPT, orderId)
-            val rejectIntent = createActionIntent(ctx, ACTION_REJECT, orderId)
-
-            // ── Tap intent — opens the app ──
-            val tapIntent = Intent(ctx, MainActivity::class.java).apply {
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
-                putExtra(EXTRA_ORDER_ID, orderId)
-            }
-            val tapPending = PendingIntent.getActivity(
-                ctx, notifId, tapIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-            )
-
-            val paymentLabel = OrderAlertService.friendlyPaymentMethod(paymentMethod)
-
-            val bigText = buildString {
-                append("Order Number: #$orderNumber\n")
-                if (customerName.isNotEmpty()) append("Customer: $customerName\n")
-                if (customerPhone.isNotEmpty()) append("Phone: $customerPhone\n")
-                if (total.isNotEmpty()) append("Total Amount: ₹$total\n")
-                if (paymentMethod.isNotEmpty()) append("Payment Method: $paymentLabel\n")
-                append("Items: $itemCount\n")
-                if (address.isNotEmpty()) append("\nDelivery Address:\n$address")
-            }.trimEnd()
-
-            val contentText = buildString {
-                append("Order #$orderNumber")
-                if (customerName.isNotEmpty()) append(" • $customerName")
-                if (total.isNotEmpty()) append(" • ₹$total")
-                if (paymentMethod.isNotEmpty()) append(" ($paymentLabel)")
-            }
-
-            // ── Build notification ──
-            val notification = NotificationCompat.Builder(ctx, channelId)
-                .setSmallIcon(android.R.drawable.ic_dialog_alert)
-                .setColor(0xFF16A34A.toInt())
-                .setColorized(true)
-                .setContentTitle("NEW ORDER")
-                .setSubText("#$orderNumber")
-                .setContentText(contentText)
-                .setStyle(
-                    NotificationCompat.BigTextStyle()
-                        .setBigContentTitle("NEW ORDER")
-                        .setSummaryText("#$orderNumber")
-                        .bigText(bigText)
-                )
-                .setPriority(NotificationCompat.PRIORITY_MAX)
-                .setCategory(NotificationCompat.CATEGORY_ALARM)
-                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-                .setAutoCancel(false)
-                .setOngoing(true)
-                .setContentIntent(tapPending)
-                .addAction(android.R.drawable.ic_menu_send, "ACCEPT", acceptIntent)
-                .addAction(android.R.drawable.ic_menu_close_clear_cancel, "REJECT", rejectIntent)
-                .build()
-
-            val nm = ctx.getSystemService(NotificationManager::class.java)
-            nm.notify(notifId, notification)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to show notification", e)
-        }
-    }
 
     /* ── Dismiss ── */
 
@@ -279,112 +170,33 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
         promise.resolve(isNotificationSoundEnabled(reactApplicationContext))
     }
 
+    /* ── Repeating haptic (in-app alert) ── */
+
     /**
-     * JS call: NotificationHelper.vibrateOrderAlert()
+     * JS call: NotificationHelper.startOrderAlertVibration()
      *
-     * One haptic burst for the in-app new-order alert. While the app is in the
-     * foreground no system notification is posted (the modal IS the UI), so the
-     * channel-level vibration never runs — this is the only vibration source for
-     * that path, which keeps exactly one buzz per alert.
+     * Start — or re-assert — the repeating new-order haptic owned by
+     * [OrderVibration]. The loop is a hardware waveform repeat, not a JS timer,
+     * and a second call for the same alert cannot create a second loop.
      *
-     * The burst always carries an *alarm* usage: VibrationAttributes on API 31+,
-     * AudioAttributes on API 26–30. A bare Vibrator.vibrate(effect) runs with
-     * *notification* usage, which the platform and OEM skins (MIUI and friends)
-     * drop whenever the ringtone is silent or Do Not Disturb is on — an order
-     * alert must not be silenced by that. Never gated by the sound
-     * preference: a muted alert is a silent alert, not an invisible one.
-     *
-     * [ORDER-VIBE] logs are the field diagnostic for "the popup appeared but the
-     * phone never buzzed" — they name the state of every hop.
+     * Never gated by the sound preference: Sound OFF means a silent alert, not
+     * an invisible one.
      */
     @ReactMethod
-    fun vibrateOrderAlert() {
-        val ctx = reactApplicationContext
-        val sdk = Build.VERSION.SDK_INT
-        val manager = ctx.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
-        val vibrator: Vibrator? = manager?.defaultVibrator
-            ?: ctx.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
-
-        val nm = ctx.getSystemService(NotificationManager::class.java)
-        val am = ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-        val ringerMode = when (am?.ringerMode) {
-            AudioManager.RINGER_MODE_NORMAL -> "normal"
-            AudioManager.RINGER_MODE_VIBRATE -> "vibrate"
-            AudioManager.RINGER_MODE_SILENT -> "silent"
-            else -> "unknown(${am?.ringerMode})"
-        }
-        Log.i(
-            TAG,
-            "[ORDER-VIBE] request sdk=$sdk hasVibrator=${vibrator?.hasVibrator() == true} " +
-                "ringerMode=$ringerMode interruptionFilter=${nm.currentInterruptionFilter} " +
-                "dndPolicyAccess=${nm.isNotificationPolicyAccessGranted} " +
-                "channelVibrates=${channelVibrationState(ctx)}",
-        )
-
-        if (vibrator == null || !vibrator.hasVibrator()) {
-            Log.e(TAG, "[ORDER-VIBE] STOPPED HERE — no vibrator handle for sdk=$sdk")
-            return
-        }
-        val motor: Vibrator = vibrator
-
-        val effect = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            VibrationEffect.createWaveform(ORDER_ALERT_VIBRATION_PATTERN, -1)
-        } else {
-            null
-        }
-
-        try {
-            if (sdk >= Build.VERSION_CODES.S && effect != null) {
-                motor.vibrate(
-                    effect,
-                    VibrationAttributes.createForUsage(VibrationAttributes.USAGE_ALARM),
-                )
-                Log.i(TAG, "[ORDER-VIBE] dispatched with VibrationAttributes USAGE_ALARM")
-            } else if (effect != null) {
-                // API 26–30 (the field device is 29): the bare vibrate(effect) runs
-                // as a *notification*, which MIUI and AOSP both drop when the
-                // ringer is silent. This overload carries the alarm usage instead.
-                motor.vibrate(
-                    effect,
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_ALARM)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                        .build(),
-                )
-                Log.i(TAG, "[ORDER-VIBE] dispatched with AudioAttributes USAGE_ALARM")
-            } else {
-                // API 24/25 has no VibrationEffect; the waveform overload there is the
-                // only way to reuse the shared pattern.
-                motor.vibrate(ORDER_ALERT_VIBRATION_PATTERN, -1)
-                Log.i(TAG, "[ORDER-VIBE] dispatched via legacy waveform")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "[ORDER-VIBE] STOPPED HERE — vibrate() threw: ${e.message}", e)
-            return
-        }
-
-        // The motor state is not queryable on current SDKs (Vibrator.isVibrating()
-        // was removed), so this second line is the post-dispatch environment sample:
-        // separating "we never asked" (no dispatch line at all) from "we asked and
-        // the OS/OEM dropped it" (dispatch line, then a silent ringer here).
-        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-            Log.i(
-                TAG,
-                "[ORDER-VIBE] 250ms after dispatch ringerMode=$ringerMode " +
-                    "interruptionFilter=${nm.currentInterruptionFilter} " +
-                    "channelVibrates=${channelVibrationState(ctx)}",
-            )
-        }, 250)
+    fun startOrderAlertVibration() {
+        OrderVibration.start(reactApplicationContext, OrderVibration.OWNER_JS)
     }
 
-    /** Whether the order-alert channel is still configured to vibrate — a channel
-     *  created by an older build keeps its pattern across installs, so this is
-     *  logged rather than assumed. */
-    private fun channelVibrationState(context: Context): String {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return "n/a(pre-O)"
-        val channel = context.getSystemService(NotificationManager::class.java)
-            .getNotificationChannel(CHANNEL_ID) ?: return "missing"
-        return "enabled=${channel.shouldVibrate()} pattern=${channel.vibrationPattern?.joinToString()}"
+    /**
+     * JS call: NotificationHelper.stopOrderAlertVibration()
+     *
+     * The JS runtime no longer has a pending alert to vibrate for. Safe to call
+     * multiple times, and the motor only stops when the last owner leaves — so
+     * this can never silence a background alert the service is still ringing.
+     */
+    @ReactMethod
+    fun stopOrderAlertVibration() {
+        OrderVibration.stop(reactApplicationContext, OrderVibration.OWNER_JS)
     }
 
     /* ── API base URL (native-only paths) ── */
@@ -615,38 +427,24 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
         }
     }
 
-    /* ── Alert Sound (Background/Killed: foreground service with notification) ── */
+    /* ── Background / killed alert (foreground service with a generic notification) ── */
 
     /**
-     * Start the foreground order alert service (loops alert.mp3).
-     * Shows a persistent notification with ACCEPT / REJECT actions.
-     * Used for background/killed states only.
+     * Start the foreground order alert service (loops alert.mp3 and runs the
+     * repeating haptic).
      *
-     * JS call:
-     *   NotificationHelper.startOrderAlert({
-     *     orderId, orderNumber, customerName, customerPhone,
-     *     address, total, paymentMethod, paymentStatus, items
-     *   })
+     * JS call: NotificationHelper.startOrderAlert({ orderId })
+     *
+     * Only the order id crosses the bridge, on purpose: the service's
+     * notification is generic ("Sajjan Mart" / "1 New Order"), so customer name,
+     * phone, address, amount and items must not travel into an intent that a
+     * lock-screen notification could otherwise expose.
      */
     @ReactMethod
     fun startOrderAlert(data: ReadableMap) {
-        Log.d(TAG, "[ORDER-ALERT] startOrderAlert called from JS")
-
         val orderId = data.getString("orderId") ?: return
-        val orderNumber = data.getString("orderNumber") ?: orderId
-        val customerName = data.getString("customerName") ?: ""
-        val customerPhone = data.getString("customerPhone") ?: ""
-        val address = data.getString("address") ?: ""
-        val total = data.getString("total") ?: ""
-        val paymentMethod = data.getString("paymentMethod") ?: ""
-        val paymentStatus = data.getString("paymentStatus") ?: ""
-        val itemsJson = data.getString("items") ?: "[]"
-
-        OrderAlertService.start(
-            reactApplicationContext,
-            orderId, orderNumber, customerName, customerPhone,
-            address, total, paymentMethod, paymentStatus, itemsJson,
-        )
+        Log.d(TAG, "[ORDER-ALERT] startOrderAlert called from JS for order $orderId")
+        OrderAlertService.start(reactApplicationContext, orderId)
     }
 
     /**
@@ -741,20 +539,40 @@ class NotificationHelperModule(reactContext: ReactApplicationContext) :
         promise.resolve(orderId)
     }
 
-    /* ── Helpers ── */
+    /* ── Notification tap (generic order-alert → Orders screen) ── */
 
-    private fun createActionIntent(ctx: Context, action: String, orderId: String, orderNumber: String = orderId): PendingIntent {
-        val intent = Intent(ctx, NotificationActionReceiver::class.java).apply {
-            this.action = action
-            putExtra(EXTRA_ORDER_ID, orderId)
-            putExtra(EXTRA_ACTION, action)
-            putExtra("orderNumber", orderNumber)
+    /**
+     * Called by MainActivity when the generic order-alert notification is tapped
+     * while the app is running. Emits "NotificationOpenOrders" so the JS router
+     * can show the Orders screen, then clears the stash so a later
+     * getPendingOrdersNavigation() cannot replay the same tap.
+     */
+    fun emitOrdersNavigationToJS() {
+        try {
+            if (reactApplicationContext.hasActiveReactInstance()) {
+                Log.d(TAG, "[ORDER-TAP] Emitting open-orders navigation to JS")
+                reactApplicationContext
+                    .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+                    .emit("NotificationOpenOrders", null)
+                MainActivity.pendingOrdersNavigation = false
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not emit open-orders navigation to JS: ${e.message}")
         }
-        // Unique per (order, action) — see actionRequestCode.
-        val requestCode = actionRequestCode(orderId, action)
-        return PendingIntent.getBroadcast(
-            ctx, requestCode, intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
+    }
+
+    /**
+     * JS call: NotificationHelper.getPendingOrdersNavigation() → Promise<boolean>.
+     *
+     * Returns and clears the flag MainActivity stashed from a notification tap.
+     * This is the cold-start path: the React context does not exist yet when the
+     * intent arrives, so the signal has to be pulled instead of pushed.
+     */
+    @ReactMethod
+    fun getPendingOrdersNavigation(promise: Promise) {
+        val pending = MainActivity.pendingOrdersNavigation
+        MainActivity.pendingOrdersNavigation = false
+        Log.d(TAG, "[ORDER-TAP] getPendingOrdersNavigation → $pending")
+        promise.resolve(pending)
     }
 }

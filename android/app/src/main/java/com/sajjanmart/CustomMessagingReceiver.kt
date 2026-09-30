@@ -17,10 +17,11 @@ import io.invertase.firebase.messaging.ReactNativeFirebaseMessagingReceiver
  *     - If app is backgrounded or completely killed:
  *         1. Handle entirely in native Android.
  *         2. Do NOT depend on React Native JS (never dispatch to super / HeadlessJsTask).
- *         3. Start OrderAlertService passing the complete order data — unless this
- *            device already resolved that order, in which case it must stay silent.
- *         4. Create exactly one custom notification (managed by OrderAlertService),
- *            keyed to the order so it can be cancelled on its own.
+ *         3. Start OrderAlertService with the order id — unless this device
+ *            already resolved that order, in which case it must stay silent.
+ *         4. Create exactly one generic notification (managed by
+ *            OrderAlertService): "Sajjan Mart" / "1 New Order", no order details
+ *            and no action buttons.
  *     - If app is in foreground:
  *         Do not change existing foreground popup behavior (delegate to super for JS modal).
  *   - For data.type == "ORDER_STATUS_UPDATED":
@@ -84,37 +85,21 @@ class CustomMessagingReceiver : ReactNativeFirebaseMessagingReceiver() {
                         return
                     }
 
-                    val orderNumber = getField("orderNumber", "order_number") ?: orderId
-                    val customerName = getField("customerName", "customer_name") ?: ""
-                    val customerPhone = getField("customerPhone", "customer_phone") ?: ""
-                    val address = getField("address") ?: ""
-                    val total = getField("total") ?: ""
-                    val paymentMethod = getField("paymentMethod", "payment_method") ?: ""
-                    val paymentStatus = getField("paymentStatus", "payment_status") ?: ""
-                    val itemsJson = getField("items", "itemsJson", "items_json") ?: "[]"
-                    val itemCount = getField("itemCount", "item_count") ?: ""
-
                     Log.d(TAG, "[FCM] App not in foreground — starting native OrderAlertService")
-                    Log.d(TAG, "[ORDER-ALERT] starting for order: $orderId (#$orderNumber)")
+                    Log.d(TAG, "[ORDER-ALERT] starting alert for order: $orderId")
 
-                    // Start native OrderAlertService with complete order payload.
-                    // The notification id is derived from orderId, so a repeat
-                    // delivery of the same order replaces its own notification
-                    // instead of stacking a duplicate — no global cancellation
-                    // of unrelated notifications is needed.
-                    OrderAlertService.start(
-                        context = context,
-                        orderId = orderId,
-                        orderNumber = orderNumber,
-                        customerName = customerName,
-                        customerPhone = customerPhone,
-                        address = address,
-                        total = total,
-                        paymentMethod = paymentMethod,
-                        paymentStatus = paymentStatus,
-                        itemsJson = itemsJson,
-                        itemCount = itemCount,
-                    )
+                    /*
+                     * Only the order id is handed over. The alert notification the
+                     * service posts is generic ("Sajjan Mart" / "1 New Order"), so
+                     * customer, phone, address, amount and items never enter an
+                     * intent that outlives the app in the notification shade.
+                     *
+                     * The service owns one alert entry for all pending orders, so a
+                     * repeat delivery of the same order re-posts that entry instead
+                     * of stacking a duplicate — no global cancellation of unrelated
+                     * notifications is needed.
+                     */
+                    OrderAlertService.start(context = context, orderId = orderId)
 
                     // CRITICAL: Return immediately!
                     // Do NOT call super.onReceive() in background/killed state for NEW_ORDER.

@@ -8,10 +8,14 @@
  *   FCM Push  →  notification.service  →  Order Event  →  Order Store  →  UI
  *
  * App State Handling:
- *   FOREGROUND  →  onMessage() fires → JS shows modal + starts sound
+ *   FOREGROUND  →  onMessage() fires → JS shows modal + starts sound + haptic
  *   BACKGROUND  →  CustomMessagingReceiver starts native OrderAlertService directly
  *   KILLED      →  CustomMessagingReceiver starts native OrderAlertService directly
  *                  (no JS dependency for background/killed NEW_ORDER)
+ *
+ * The background / killed notification is generic by design — "Sajjan Mart" /
+ * "1 New Order", no order details and no action buttons — and tapping it opens
+ * the app on the Orders screen (see setOpenOrdersHandler()).
  *
  * Notification Actions (ACCEPT/REJECT):
  *   App alive  →  DeviceEventEmitter receives from NotificationHelperModule
@@ -19,10 +23,11 @@
  *
  * Sound:
  *   The persisted "Notification Sound" preference (src/config/notificationSound,
- *   stored in Android SharedPreferences) gates the alert AUDIO only. This file
- *   fires the new-order haptic when a push is claimed, so with sound OFF the
- *   alert still vibrates — in the foreground through vibrateOrderAlert(), in
- *   background / killed through the notification channel's pattern.
+ *   stored in Android SharedPreferences) gates the alert AUDIO only.
+ * Vibration:
+ *   The repeating new-order haptic is owned by src/services/orderVibration.ts
+ *   (one native loop, no JS timers) and is never gated by that preference:
+ *   Sound OFF means a silent alert, not an invisible one.
  */
 
 import {
@@ -45,9 +50,15 @@ import type { RemoteMessage } from '@react-native-firebase/messaging';
 import { apiPost } from './api.client';
 import { syncApiBaseUrlToNative } from '../config/apiBaseUrl';
 import {
+  startOrderVibration,
+  stopOrderVibration,
+} from './orderVibration';
+import {
   claimNewOrderAlert,
   applyOrderDecision,
+  decidedStatusFor,
   dismissStaleAlert,
+  isAlertActive,
   resetOrderAlertState,
   activeAlertsSnapshot,
 } from './orderAlertSync';
@@ -101,10 +112,12 @@ export type NotificationActionHandler = (
 let onIncomingOrder: IncomingOrderHandler | null = null;
 let onNotificationAction: NotificationActionHandler | null = null;
 let onTappedOrder: ((orderId: string) => void) | null = null;
+let onOpenOrders: (() => void) | null = null;
 let unsubscribeForeground: (() => void) | null = null;
 let unsubscribeNotificationOpened: (() => void) | null = null;
 let unsubscribeActionEvent: { remove: () => void } | null = null;
 let unsubscribeTapEvent: { remove: () => void } | null = null;
+let unsubscribeOpenOrdersEvent: { remove: () => void } | null = null;
 let unsubscribeTokenRefresh: (() => void) | null = null;
 
 // Duplicate protection: track processed order+action combos
@@ -145,30 +158,17 @@ let registrationRetryAttempts = 0;
 
 const NATIVE_MODULE = NativeModules.NotificationHelper as
   | {
-      showOrderNotification: (data: {
-        orderId: string;
-        customerName: string;
-        itemCount: string;
-        total: string;
-      }) => void;
       dismissNotification: (orderId: string) => void;
       startForegroundSound: () => void;
       stopForegroundSound: () => void;
-      startOrderAlert: (data: {
-        orderId: string;
-        orderNumber: string;
-        customerName: string;
-        customerPhone: string;
-        address: string;
-        total: string;
-        paymentMethod: string;
-        paymentStatus: string;
-        items: string;
-      }) => void;
+      /** Only the order id crosses: the alert notification carries no order data */
+      startOrderAlert: (data: { orderId: string }) => void;
       stopOrderAlert: () => void;
-      /** One haptic burst for a claimed foreground alert (pattern lives in Kotlin) */
-      vibrateOrderAlert: () => void;
+      /** Repeating haptic — one native loop, no JS timers */
+      startOrderAlertVibration: () => void;
+      stopOrderAlertVibration: () => void;
       getTappedOrderId: () => Promise<string | null>;
+      getPendingOrdersNavigation: () => Promise<boolean>;
     }
   | undefined;
 export const ORDER_CHANNEL_ID = 'sajjanmart_orders';
@@ -377,9 +377,10 @@ export async function initializeNotifications(
 export function resetNotificationInitialization(): void {
   initializedForUser = null;
   clearDeviceRegistrationRetry();
-  // A different account must not inherit this device's alert set or its
-  // decided-order tombstones (nor the reverse: signing out clears the state a
-  // re-login would otherwise suppress against).
+  // A different account must not inherit this device's alert set, its
+  // decided-order tombstones or its repeating haptic — resetOrderAlertState()
+  // releases the haptic as part of clearing the alerts, so the next session
+  // cannot start from a motor that is still buzzing for the previous one.
   resetOrderAlertState();
   if (__DEV__) {
     console.log('[FCM] Notification initialization guard reset');
@@ -397,12 +398,12 @@ async function runNotificationInit(userKey: string): Promise<void> {
   // exact bug that made every background tap fail with "No connection".
   syncApiBaseUrlToNative();
 
-  // TEMPORARY FIELD DIAGNOSTIC — one line per session start telling us whether
-  // the installed APK even exposes the haptic. Delete with the other
-  // [ORDER-VIBE] logs once the two-phone test passes.
+  // Field diagnostic, logged unconditionally: the installed APK is the only
+  // thing that can be missing the haptic bridge, and a release build that
+  // cannot vibrate has to say so in the logs rather than fail silently.
   console.log(
     `[ORDER-VIBE] bridge at init: module=${NATIVE_MODULE ? 'present' : 'MISSING'} ` +
-      `vibrateOrderAlert=${typeof NATIVE_MODULE?.vibrateOrderAlert}`,
+      `startOrderAlertVibration=${typeof NATIVE_MODULE?.startOrderAlertVibration}`,
   );
 
   // Permission + token registration must never prevent the listeners below
@@ -450,6 +451,7 @@ async function runNotificationInit(userKey: string): Promise<void> {
   startNotificationOpenedListener();
   startActionEventListener();
   startTapEventListener();
+  startOpenOrdersListener();
 
   initializedForUser = userKey;
 
@@ -473,11 +475,32 @@ export function setIncomingOrderHandler(handler: IncomingOrderHandler): void {
   if (bufferedIncomingOrder) {
     const buffered = bufferedIncomingOrder;
     bufferedIncomingOrder = null;
+
+    /* The buffer can sit in the runtime for a long time — it is flushed whenever
+     * a screen registers the handler, including after the order was already
+     * accepted or rejected while this screen was unmounted (navigating to
+     * Settings, or a remote device's decision). Re-playing it then reopens the
+     * alert of a settled order, which is exactly the "it popped up again after I
+     * accepted it" failure. An alert only replays while it is still live. */
+    if (decidedStatusFor(buffered.orderId) || !isAlertActive(buffered.orderId)) {
+      if (__DEV__) {
+        console.log(
+          `[FCM] Buffered NEW_ORDER dropped — order ${buffered.orderId} is no longer awaiting a decision`,
+        );
+      }
+      return;
+    }
+
     if (__DEV__) {
       console.log(
         `[FCM] Replaying buffered NEW_ORDER for order ${buffered.orderId}`,
       );
     }
+    // The screen that owned the repeating haptic may have unmounted (and
+    // released it) in the meantime; re-arming for the same order is a no-op
+    // while it is still vibrating, so the replayed alert is felt as well as
+    // heard exactly like the original push.
+    startOrderVibration(buffered.orderId);
     handler(buffered);
   }
 }
@@ -546,15 +569,22 @@ export function routeOrderEventData(
 
   if (source !== 'foreground') {
     // No JS UI exists in the background/killed runtime; the native alert is
-    // already running and the order is recorded so the next foreground render
-    // reconciles instead of re-alerting. The notification it posted already
-    // vibrated, so this path must not buzz a second time.
+    // already running — it owns the siren and the repeating haptic as
+    // OrderVibration's service owner — and the order is recorded so the next
+    // foreground render reconciles instead of re-alerting. Claiming a JS haptic
+    // owner here would leave a second claim nobody ever releases.
     return;
   }
 
-  // Claimed exactly once per order, so this is one haptic per alert — a delivery
-  // retry or a replayed buffer returns at the claim above.
-  vibrateForNewOrderAlert(orderId);
+  /*
+   * The repeating haptic belongs to the alert, not to the modal: it starts as
+   * soon as this device claims the order, so a push that lands while no screen
+   * has registered the incoming-order handler is still felt. Claimed exactly
+   * once per order, so this cannot start a second loop — a delivery retry or a
+   * replayed buffer returns at the claim above, and orderVibration.ts ignores a
+   * repeat for the order it is already vibrating for.
+   */
+  startOrderVibration(orderId);
 
   if (onIncomingOrder) {
     if (__DEV__) {
@@ -614,21 +644,11 @@ export function stopForegroundListener(): void {
 }
 
 /* ──────────────────────────────────────────────────────────────────────
- * Native Notification Display
+ * Native Notification Dismissal
  *
- * Shows an Android notification with ACCEPT / REJECT action buttons.
+ * The alert notification itself is posted natively (OrderAlertService) and is
+ * generic on purpose, so JS only ever clears notifications here.
  * ────────────────────────────────────────────────────────────────────── */
-
-export function showNativeOrderNotification(data: OrderNotificationData): void {
-  if (Platform.OS !== 'android' || !NATIVE_MODULE) return;
-
-  NATIVE_MODULE.showOrderNotification({
-    orderId: data.orderId,
-    customerName: data.customerName,
-    itemCount: data.itemCount,
-    total: data.total,
-  });
-}
 
 export function dismissNotification(orderId: string): void {
   if (Platform.OS !== 'android' || !NATIVE_MODULE) return;
@@ -636,74 +656,16 @@ export function dismissNotification(orderId: string): void {
 }
 
 /* ──────────────────────────────────────────────────────────────────────
- * Native Order Alert Sound (for foreground JS start)
+ * Native Order Alert (background / killed foreground service)
  *
- * Starts the foreground service from JS when the app is in foreground.
- * In background/killed, CustomMessagingReceiver starts it directly.
+ * CustomMessagingReceiver starts that service natively, with no JS runtime
+ * involved, so there is no JS-side start path here. The stop is exposed because
+ * the runtime that resolves an order has to be able to end the alert.
  * ────────────────────────────────────────────────────────────────────── */
-
-export function startNativeOrderAlert(data: OrderNotificationData): void {
-  if (Platform.OS !== 'android' || !NATIVE_MODULE) return;
-
-  NATIVE_MODULE.startOrderAlert({
-    orderId: data.orderId,
-    orderNumber: data.orderNumber || data.orderId,
-    customerName: data.customerName,
-    customerPhone: data.customerPhone || '',
-    address: data.address || '',
-    total: data.total,
-    paymentMethod: data.paymentMethod || '',
-    paymentStatus: data.paymentStatus || '',
-    items: data.items || '[]',
-  });
-}
 
 export function stopNativeOrderAlert(): void {
   if (Platform.OS !== 'android' || !NATIVE_MODULE) return;
   NATIVE_MODULE.stopOrderAlert();
-}
-
-/**
- * Fire the new-order haptic.
- *
- * Never checks the sound preference — sound OFF must still vibrate. It runs
- * only for a claimed foreground push, which is the single JS vibration point:
- * a foreground alert posts no system notification (the modal is the UI), and
- * background / killed alerts vibrate through the notification channel instead.
- *
- * TEMPORARY FIELD DIAGNOSTICS ([ORDER-VIBE]): logged unconditionally, not just
- * under __DEV__, so a release APK in the store tells us which hop dropped the
- * buzz. The Kotlin side logs the device state (SDK, ringer mode, DND, channel
- * config) under the same tag. Remove once the two-phone test passes.
- */
-function vibrateForNewOrderAlert(orderId: string): void {
-  if (Platform.OS !== 'android') {
-    console.log(`[ORDER-VIBE] SKIP order=${orderId} reason=not-android`);
-    return;
-  }
-  if (!NATIVE_MODULE) {
-    console.log(`[ORDER-VIBE] SKIP order=${orderId} reason=no-native-module`);
-    return;
-  }
-  if (typeof NATIVE_MODULE.vibrateOrderAlert !== 'function') {
-    console.log(
-      `[ORDER-VIBE] SKIP order=${orderId} reason=bridge-method-missing ` +
-        `(the installed APK has no vibrateOrderAlert — reinstall the new build)`,
-    );
-    return;
-  }
-
-  try {
-    NATIVE_MODULE.vibrateOrderAlert();
-    console.log(
-      `[ORDER-VIBE] JS dispatched order=${orderId} — look for the matching [ORDER-VIBE] line from Kotlin`,
-    );
-  } catch (error) {
-    console.log(
-      `[ORDER-VIBE] FAIL order=${orderId} bridge call threw:`,
-      error instanceof Error ? error.message : String(error),
-    );
-  }
 }
 
 /* ──────────────────────────────────────────────────────────────────────
@@ -753,6 +715,57 @@ function startTapEventListener(): void {
       if (payload?.orderId && onTappedOrder) {
         onTappedOrder(payload.orderId);
       }
+    },
+  );
+}
+
+/* ──────────────────────────────────────────────────────────────────────
+ * Order-alert notification tap → Orders screen
+ *
+ * The background / killed alert notification is generic and carries no order, so
+ * a tap means one thing: open the app on the Orders screen, where the staff can
+ * see the order and decide it.
+ *
+ * Cold start: MainActivity stashes the flag → JS pulls consumePendingOrdersNavigation().
+ * App running: MainActivity pushes "NotificationOpenOrders" → this listener.
+ * ────────────────────────────────────────────────────────────────────── */
+
+/** Pull (and clear) the "open the Orders screen" flag set by a notification tap. */
+export function consumePendingOrdersNavigation(): Promise<boolean> {
+  if (Platform.OS !== 'android' || !NATIVE_MODULE) {
+    return Promise.resolve(false);
+  }
+  return NATIVE_MODULE.getPendingOrdersNavigation().catch(() => false);
+}
+
+/**
+ * Register the screen router for a notification tap.
+ *
+ * Lives in App.tsx, not in a screen: the tap must work whichever screen is
+ * showing (Settings, Notification Settings), and AppContent is the only place
+ * that holds the navigation state.
+ */
+export function setOpenOrdersHandler(handler: (() => void) | null): void {
+  onOpenOrders = handler;
+}
+
+export function removeOpenOrdersHandler(): void {
+  onOpenOrders = null;
+}
+
+/** Listen for the generic alert notification's tap while the app is alive. */
+function startOpenOrdersListener(): void {
+  if (unsubscribeOpenOrdersEvent) {
+    unsubscribeOpenOrdersEvent.remove();
+  }
+
+  unsubscribeOpenOrdersEvent = DeviceEventEmitter.addListener(
+    'NotificationOpenOrders',
+    () => {
+      if (__DEV__) {
+        console.log('[ORDER-TAP] Order alert notification tapped — opening Orders');
+      }
+      onOpenOrders?.();
     },
   );
 }
@@ -854,8 +867,8 @@ export function processAction(
  *   409  → dismissStaleAlert: another device won the atomic pending-exit claim,
  *          so this alert is stale rather than retryable.
  *   else → log the real reason and touch nothing else. The siren was already
- *          silenced by the receiver at the tap; the notification, with its
- *          ACCEPT / REJECT buttons, is the retry point.
+ *          silenced by the receiver at the tap; the alert notification is still
+ *          in the shade, and the Orders screen it opens is the retry point.
  */
 export async function settleNotificationAction(
   action: 'ORDER_ACCEPT' | 'ORDER_REJECT',
@@ -976,17 +989,9 @@ export function registerBackgroundHandler(): void {
       // Claim before ringing — a decided order must never start the alert.
       const claimed = claimNewOrderAlert(data.orderId, data.orderNumber);
       if (claimed && Platform.OS === 'android' && NATIVE_MODULE) {
-        NATIVE_MODULE.startOrderAlert({
-          orderId: data.orderId || '',
-          orderNumber: data.orderNumber || data.orderId || '',
-          customerName: data.customerName || '',
-          customerPhone: data.customerPhone || '',
-          address: data.address || '',
-          total: data.total || '',
-          paymentMethod: data.paymentMethod || '',
-          paymentStatus: data.paymentStatus || '',
-          items: data.items || '[]',
-        });
+        // Only the order id: the service's notification is generic, so no
+        // customer, payment or address data enters it.
+        NATIVE_MODULE.startOrderAlert({ orderId: data.orderId || '' });
       }
       return;
     }

@@ -35,7 +35,7 @@ class MainApplication : Application(), ReactApplication {
         PackageList(this).packages.apply {
           add(NotificationHelperPackage())
         },
-      useDevSupport = !hasEmbeddedBundle,
+      useDevSupport = ReactBuildConfig.DEBUG,
     )
   }
 

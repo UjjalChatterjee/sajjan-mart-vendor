@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   View,
   Text,
@@ -11,6 +11,8 @@ import {
 } from 'react-native';
 import { Colors } from '../theme/colors';
 import type { Order } from '../types';
+import { PREP_DEFAULT_MINUTES, isFoodOrder } from '../services/prepTimer';
+import { MakingTimeStepper } from './MakingTimeStepper';
 import {
   startOrderAlertSound,
   stopOrderAlertSound,
@@ -111,14 +113,21 @@ function AnimatedLabel() {
 interface NewOrderAlertModalProps {
   visible: boolean;
   order: Order | null;
-  onAccept: (orderId: string) => void;
+  /**
+   * `preparationMinutes` is sent only for a food order; it is undefined for
+   * every other order so the accept request never carries a timer the backend
+   * would have to discard.
+   */
+  onAccept: (orderId: string, preparationMinutes?: number) => void;
   onReject: (orderId: string) => void;
 }
 
 /* ──────────────────────────────────────────────────────────────────────
  * NewOrderAlertModal
  *
- * The ONLY place in the app where Accept / Reject actions exist.
+ * The popup shown by a NEW_ORDER push. OrderCard in the New Order tab offers
+ * the same two decisions for the same order, so both carry the Making Time
+ * stepper and both funnel into one settleDecision path in OrdersScreen.
  * Cannot be dismissed by tapping outside, swiping, or auto-timer.
  *
  * Shows complete order details:
@@ -140,6 +149,9 @@ export function NewOrderAlertModal({
 }: NewOrderAlertModalProps) {
   const overlayAnim = useRef(new Animated.Value(0)).current;
   const scaleAnim = useRef(new Animated.Value(0.95)).current;
+  const [preparationMinutes, setPreparationMinutes] = useState(
+    PREP_DEFAULT_MINUTES,
+  );
 
   useEffect(() => {
     if (visible) {
@@ -170,11 +182,20 @@ export function NewOrderAlertModal({
     }
   }, [visible, overlayAnim, scaleAnim]);
 
+  // Every order the vendor is shown starts at the default — including a second
+  // NEW_ORDER that replaces the first while the popup never closed, which is
+  // why the order id is part of the key and not just the visibility.
+  useEffect(() => {
+    if (visible) setPreparationMinutes(PREP_DEFAULT_MINUTES);
+  }, [visible, order?.id]);
+
   if (!order) return null;
+
+  const isFood = isFoodOrder(order);
 
   const handleAccept = () => {
     stopOrderAlertSound();
-    onAccept(order.id);
+    onAccept(order.id, isFood ? preparationMinutes : undefined);
   };
 
   const handleReject = () => {
@@ -262,6 +283,14 @@ export function NewOrderAlertModal({
             {/* ── Payment Info ── */}
             {paymentDisplay ? (
               <Text style={s.paymentInfo}>💳 {paymentDisplay}</Text>
+            ) : null}
+
+            {/* ── Making time — food orders only ── */}
+            {isFood ? (
+              <MakingTimeStepper
+                value={preparationMinutes}
+                onChange={setPreparationMinutes}
+              />
             ) : null}
 
             {/* ── Actions ── */}
@@ -462,6 +491,9 @@ const s = StyleSheet.create({
     color: Colors.gray500,
     marginBottom: 18,
   },
+
+  /* Preparation time stepper lives in MakingTimeStepper so the order card and
+     this popup show identical controls. */
 
   /* Actions */
   actions: {

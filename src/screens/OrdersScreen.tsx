@@ -44,9 +44,12 @@ import {
   markOrderAlerted,
 } from '../services/notification.service';
 import { stopOrderAlertSound } from '../services/sound.service';
+import { stopOrderVibration } from '../services/orderVibration';
+import { showsPreparationTimer } from '../services/prepTimer';
+import { buildOrderFromNotification, mergeAlertOrder } from '../services/pushOrder';
 import { ErrorModal } from '../components/ErrorModal';
 import { CancelRequestOrderCard } from '../components/CancelRequestOrderCard';
-import type { Order, OrderItem } from '../types';
+import type { Order } from '../types';
 
 /* ── Fixed tab system with status mapping ── */
 
@@ -67,83 +70,6 @@ const FIXED_TABS: TabDef[] = [
 
 function ordersInTab(orders: Order[], statuses: string[]): Order[] {
   return orders.filter(o => statuses.includes(o.status));
-}
-
-/**
- * Parse items JSON string into OrderItem[].
- * Used when order data arrives via FCM (only items JSON is available).
- */
-function parseItemsJson(itemsJson?: string): OrderItem[] {
-  if (!itemsJson) return [];
-  try {
-    const items = JSON.parse(itemsJson);
-    if (!Array.isArray(items)) return [];
-    return items.map((item: any, index: number) => ({
-      id: item.id || String(index + 1),
-      name: item.name || `Item ${index + 1}`,
-      variantName: item.variantName,
-      quantity: Number(item.quantity) || 1,
-      price: Number(item.price) || 0,
-      unit: item.unit,
-      image: item.image,
-      total: Number(item.total) || (Number(item.price) || 0) * (Number(item.quantity) || 1),
-      ready: false,
-      cancelled: false,
-    }));
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Build an Order from FCM notification data.
- * Handles whatever data the backend sends in the FCM payload.
- */
-function buildOrderFromNotification(data: {
-  orderId: string;
-  orderNumber?: string;
-  customerName: string;
-  customerPhone?: string;
-  address?: string;
-  itemCount: string;
-  total: string;
-  paymentMethod?: string;
-  paymentStatus?: string;
-  items?: string;
-}): Order {
-  const items = parseItemsJson(data.items);
-
-  // If no items JSON, create placeholder items from itemCount
-  const placeholderItems = items.length > 0 ? items : Array.from(
-    { length: parseInt(data.itemCount, 10) || 0 },
-    (_, i) => ({
-      id: String(i + 1),
-      name: `Item ${i + 1}`,
-      quantity: 1,
-      price: 0,
-      total: 0,
-      ready: false,
-      cancelled: false,
-    }),
-  );
-
-  return {
-    id: data.orderId,
-    orderNumber: data.orderNumber,
-    customerName: data.customerName || 'Customer',
-    customerPhone: data.customerPhone || '',
-    deliveryAddress: data.address || '',
-    status: 'pending' as const,
-    items: placeholderItems,
-    subtotal: parseInt(data.total, 10) || 0,
-    discount: 0,
-    deliveryCharge: 0,
-    tax: 0,
-    grandTotal: parseInt(data.total, 10) || 0,
-    createdAt: new Date().toISOString(),
-    paymentMethod: data.paymentMethod,
-    paymentStatus: data.paymentStatus,
-  };
 }
 
 export function OrdersScreen() {
@@ -182,6 +108,27 @@ export function OrdersScreen() {
   useEffect(() => {
     pendingOrderIdRef.current = pendingNewOrder?.id ?? null;
   }, [pendingNewOrder]);
+
+  /**
+   * A push describes an order; it is not the order. The alert opens from the
+   * payload at once (the vendor must be told immediately) and is then re-read
+   * from the API so the popup works from the same record every other device
+   * sees — the item markers the Making Time selector needs, and the amounts.
+   *
+   * `status` deliberately stays as the alert reported it: this only corrects
+   * order *content*, never order *state*, which cross-device sync owns.
+   */
+  const hydrateAlertOrder = useCallback((orderId: string | undefined) => {
+    if (!orderId) return;
+    getOrders()
+      .then(list => {
+        const fresh = list.find(o => o.id === orderId);
+        setPendingNewOrder(prev => mergeAlertOrder(prev, fresh ?? null));
+      })
+      .catch(() => {
+        // A failed read keeps the payload's data instead of inventing any.
+      });
+  }, []);
 
   // ── Tab scrolling ──
   const tabsScrollRef = useRef<any>(null);
@@ -249,6 +196,7 @@ export function OrdersScreen() {
       const incoming = buildOrderFromNotification(data);
       setPendingNewOrder(incoming);
       setNewOrderVisible(true);
+      hydrateAlertOrder(data.orderId);
     });
 
     // NEW_ORDER notification tap: open the same modal (deduped by order id)
@@ -297,6 +245,7 @@ export function OrdersScreen() {
         const incoming = buildOrderFromNotification(data);
         setPendingNewOrder(incoming);
         setNewOrderVisible(true);
+        hydrateAlertOrder(data.orderId);
       }
     });
 
@@ -316,10 +265,14 @@ export function OrdersScreen() {
       // Navigating away (Settings / Notification Settings) unmounts the modal
       // without it ever reaching Accept/Reject. Without this the native
       // MediaPlayer keeps looping for the rest of the process life, and its
-      // "already playing" guard then mutes every later alert.
+      // "already playing" guard then mutes every later alert. The repeating
+      // haptic ends on the same rule — one owner leaving must not leave the
+      // motor buzzing for an alert nobody can act on.
       stopOrderAlertSound();
+      stopOrderVibration();
     };
-  }, []);
+    // hydrateAlertOrder is a stable useCallback, so this effect still runs once.
+  }, [hydrateAlertOrder]);
 
   // Another device (or a notification button) decided one of our alerted
   // orders: close its modal. Sound, notification and cache are handled by
@@ -350,12 +303,19 @@ export function OrdersScreen() {
    * device already moved the order out of pending — the alert is stale, so the
    * latest order state is fetched and the alert dismissed instead of retried.
    * Returns false when the decision belonged to someone else.
+   *
+   * `preparationMinutes` comes only from the popup stepper of a food order; the
+   * server owns the deadline either way.
    */
   const settleDecision = useCallback(
-    async (orderId: string, outcome: 'ACCEPTED' | 'REJECTED'): Promise<boolean> => {
+    async (
+      orderId: string,
+      outcome: 'ACCEPTED' | 'REJECTED',
+      preparationMinutes?: number,
+    ): Promise<boolean> => {
       try {
         if (outcome === 'ACCEPTED') {
-          await acceptOrder(orderId);
+          await acceptOrder(orderId, preparationMinutes);
         } else {
           await rejectOrder(orderId);
         }
@@ -510,6 +470,20 @@ export function OrdersScreen() {
       new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
   );
 
+  // One clock for the whole visible list. Each card still computes
+  // `preparationDueAt - now`, so this interval only decides how often the text
+  // repaints — it cannot drift, and it stops when nothing on screen has a timer.
+  const [prepNow, setPrepNow] = useState(() => Date.now());
+  const anyPrepTimer = filteredOrders.some(showsPreparationTimer);
+  useEffect(() => {
+    if (!anyPrepTimer) return;
+    // Resync on entering a tab with timers: the state may have been set a while
+    // ago while the screen was on another tab or backgrounded.
+    setPrepNow(Date.now());
+    const id = setInterval(() => setPrepNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [anyPrepTimer]);
+
   // Horizontal swipe between tabs (right→left = next, left→right = previous)
   const swipeTabBy = useCallback(
     (dir: 1 | -1) => {
@@ -543,10 +517,10 @@ export function OrdersScreen() {
   // Modal actions — one decision path for the modal, the cards and the
   // notification buttons, so cross-device cleanup can never be half-implemented
   const handleModalAccept = useCallback(
-    async (orderId: string) => {
+    async (orderId: string, preparationMinutes?: number) => {
       try {
         console.log('[ORDER-ACTION] ACCEPT via modal');
-        await settleDecision(orderId, 'ACCEPTED');
+        await settleDecision(orderId, 'ACCEPTED', preparationMinutes);
       } catch (err) {
         setErrorModalMessage(
           err instanceof Error ? err.message : 'Failed to accept order',
@@ -704,11 +678,16 @@ export function OrdersScreen() {
               return (
                 <OrderCard
                   order={item}
+                  prepNow={prepNow}
                   isAccepting={acceptingId === item.id}
-                  onAccept={async orderId => {
+                  onAccept={async (orderId, preparationMinutes) => {
                     setAcceptingId(orderId);
                     try {
-                      await settleDecision(orderId, 'ACCEPTED');
+                      await settleDecision(
+                        orderId,
+                        'ACCEPTED',
+                        preparationMinutes,
+                      );
                     } catch (err) {
                       setErrorModalMessage(
                         err instanceof Error ? err.message : 'Failed to accept order',
@@ -749,7 +728,7 @@ export function OrdersScreen() {
         )}
       </View>
 
-      {/* New Order Alert — the ONLY place with Accept/Reject */}
+      {/* New Order Alert — same decisions as the pending card below it */}
       <NewOrderAlertModal
         visible={newOrderVisible}
         order={pendingNewOrder}

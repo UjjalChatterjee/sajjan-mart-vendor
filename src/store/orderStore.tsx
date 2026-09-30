@@ -31,7 +31,7 @@ interface OrderStoreState {
 
 interface OrderStoreActions {
   loadOrders: () => Promise<void>;
-  acceptOrder: (id: string) => Promise<void>;
+  acceptOrder: (id: string, preparationMinutes?: number) => Promise<void>;
   rejectOrder: (id: string) => Promise<void>;
   addIncomingOrder: (order: Order) => void;
 }
@@ -66,9 +66,12 @@ export function OrderStoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   /* ── Accept ── */
-  const accept = useCallback(async (id: string) => {
-    await orderService.acceptOrder(id);
-  }, []);
+  const accept = useCallback(
+    async (id: string, preparationMinutes?: number) => {
+      await orderService.acceptOrder(id, preparationMinutes);
+    },
+    [],
+  );
 
   /* ── Reject ── */
   const reject = useCallback(async (id: string) => {

@@ -1,14 +1,27 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { TouchableOpacity, View, Text, StyleSheet } from 'react-native';
 import { Colors } from '../theme/colors';
 import { StatusBadge } from './StatusBadge';
 import { OrderItemRow } from './OrderItemRow';
+import { MakingTimeStepper } from './MakingTimeStepper';
 import type { Order } from '../types';
+import {
+  PREP_DEFAULT_MINUTES,
+  formatPreparationCountdown,
+  isFoodOrder,
+  preparationDueMs,
+  showsPreparationTimer,
+} from '../services/prepTimer';
 
 interface OrderCardProps {
   order: Order;
   onPress?: (orderId: string) => void;
-  onAccept?: (orderId: string) => void;
+  /**
+   * `preparationMinutes` is set for a food order accepted through the Making
+   * Time stepper this card renders; undefined means "let the server default
+   * decide", which is what every other accept path does.
+   */
+  onAccept?: (orderId: string, preparationMinutes?: number) => void;
   onReject?: (orderId: string) => void;
   isAccepting?: boolean;
   isRejecting?: boolean;
@@ -19,6 +32,12 @@ interface OrderCardProps {
   processingItems?: Set<string>;
   onMarkDelivered?: (orderId: string) => void;
   isDelivering?: boolean;
+  /**
+   * Shared clock tick from the screen. The countdown is always
+   * `preparationDueAt - now`, so passing a stale or absent value can only make
+   * one render a second old — it cannot drift the deadline.
+   */
+  prepNow?: number;
 }
 
 /* ── Helpers ── */
@@ -83,9 +102,11 @@ export function OrderCard({
   processingItems,
   onMarkDelivered,
   isDelivering = false,
+  prepNow,
 }: OrderCardProps) {
   const CardWrapper = onPress ? TouchableOpacity : View;
   const [expanded, setExpanded] = useState(false);
+
 
   const isConfirmed = order.status === 'confirmed';
   const totalCount = order.items.length;
@@ -106,6 +127,49 @@ export function OrderCard({
   const updatedTotalVal = order.amounts?.updatedTotal ?? order.grandTotal;
   const hasAmountChange = originalTotalVal !== updatedTotalVal;
 
+  // ── Making time — this card is the accept surface in the New Order tab ──
+  const [preparationMinutes, setPreparationMinutes] =
+    useState(PREP_DEFAULT_MINUTES);
+  const isFood = isFoodOrder(order);
+  /* Only these two backend fields decide it (never the product name), so log
+     exactly what the card received alongside the resulting decision. */
+  const markerKey = (order.items ?? [])
+    .map(item =>
+      [item.name, item.itemType ?? '-', item.productType ?? '-'].join(':'),
+    )
+    .join(',');
+  useEffect(() => {
+    console.log(
+      `[MAKING-TIME] order ${order.id} status=${order.status} isFood=${isFood} items=[${markerKey}]`,
+    );
+  }, [order.id, order.status, isFood, markerKey]);
+
+  const showMakingTime = isFood && order.status === 'pending' && !!onAccept;
+
+  // ── Food preparation countdown — one element, reused by every card variant ──
+  const dueMs = preparationDueMs(order);
+  const countdown =
+    dueMs !== null && showsPreparationTimer(order)
+      ? formatPreparationCountdown(dueMs, prepNow ?? Date.now())
+      : null;
+  const prepTimerRow = countdown ? (
+    <View
+      testID="prep-timer"
+      style={[styles.prepRow, countdown.late && styles.prepRowLate]}>
+      <Text style={[styles.prepCaption, countdown.late && styles.prepCaptionLate]}>
+        {countdown.late ? 'Late by' : 'Ready in'}
+      </Text>
+      <Text style={[styles.prepTime, countdown.late && styles.prepTimeLate]}>
+        {countdown.label}
+      </Text>
+      {countdown.late ? (
+        <View style={styles.lateBadge}>
+          <Text style={styles.lateBadgeText}>Late</Text>
+        </View>
+      ) : null}
+    </View>
+  ) : null;
+
   // ── Confirmed order rendering ──
   if (isConfirmed) {
     return (
@@ -115,6 +179,8 @@ export function OrderCard({
           <Text style={styles.orderId}>#{order.orderNumber || order.id}</Text>
           <StatusBadge status={order.status} size="small" />
         </View>
+
+        {prepTimerRow}
 
         {/* ── Meta: Date · items · customer · phone ── */}
         <Text style={styles.meta}>
@@ -292,6 +358,8 @@ export function OrderCard({
           <Text style={styles.orderId}>#{order.orderNumber || order.id}</Text>
           <StatusBadge status={order.status} size="small" />
         </View>
+
+        {prepTimerRow}
 
         {/* ── Meta: Date · items · customer · phone ── */}
         <Text style={styles.meta}>
@@ -592,6 +660,8 @@ export function OrderCard({
         <StatusBadge status={order.status} size="small" />
       </View>
 
+      {prepTimerRow}
+
       {/* Customer */}
       <Text style={styles.customerName}>{order.customerName}</Text>
       <Text style={styles.meta}>
@@ -711,6 +781,14 @@ export function OrderCard({
         </View>
       )}
 
+      {/* Making time — directly above the buttons the vendor taps to accept */}
+      {showMakingTime && (
+        <MakingTimeStepper
+          value={preparationMinutes}
+          onChange={setPreparationMinutes}
+        />
+      )}
+
       {/* Accept / Reject — only for pending orders */}
       {order.status === 'pending' && (onAccept || onReject) && (
         <View style={styles.actionRow}>
@@ -719,7 +797,9 @@ export function OrderCard({
               style={[styles.acceptBtn, isAccepting && styles.acceptBtnDisabled]}
               activeOpacity={isAccepting ? 1 : 0.7}
               disabled={isAccepting}
-              onPress={() => onAccept(order.id)}>
+              onPress={() =>
+                onAccept(order.id, isFood ? preparationMinutes : undefined)
+              }>
               <Text style={[styles.acceptBtnText, isAccepting && styles.acceptBtnTextDisabled]}>
                 {isAccepting ? 'Accepting…' : 'Accept'}
               </Text>
@@ -765,6 +845,51 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'center',
     marginBottom: 8,
+  },
+
+  /* ── Food preparation countdown ── */
+  prepRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    marginBottom: 8,
+    borderRadius: 10,
+    backgroundColor: Colors.gray100,
+  },
+  prepRowLate: {
+    backgroundColor: '#FEE2E2',
+  },
+  prepCaption: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: Colors.gray500,
+  },
+  prepCaptionLate: {
+    color: Colors.danger,
+  },
+  prepTime: {
+    flex: 1,
+    fontSize: 15,
+    fontWeight: '700',
+    color: Colors.gray900,
+    fontVariant: ['tabular-nums'],
+  },
+  prepTimeLate: {
+    color: Colors.danger,
+  },
+  lateBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 8,
+    backgroundColor: Colors.danger,
+  },
+  lateBadgeText: {
+    fontSize: 11,
+    fontWeight: '800',
+    color: Colors.white,
+    letterSpacing: 0.4,
   },
   orderId: {
     fontSize: 15,

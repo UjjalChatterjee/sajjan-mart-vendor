@@ -22,6 +22,9 @@ import { SplashScreen } from './src/components/SplashScreen';
 import {
   initializeNotifications,
   resetNotificationInitialization,
+  consumePendingOrdersNavigation,
+  removeOpenOrdersHandler,
+  setOpenOrdersHandler,
 } from './src/services/notification.service';
 import { reconcileAlertsWithBackend } from './src/services/orderAlertSync';
 
@@ -30,11 +33,33 @@ import { reconcileAlertsWithBackend } from './src/services/orderAlertSync';
  */
 function AppContent() {
   const { isInitialized, isAuthenticated, user } = useAuth();
-  const { state, resetHistoryToLogin } = useNavigation();
+  const { state, navigate, resetHistoryToLogin } = useNavigation();
   const wasAuthenticated = useRef(isAuthenticated);
   const [showSplash, setShowSplash] = useState(true);
 
   console.log('[APP] AppContent render: isInitialized=', isInitialized, '| isAuthenticated=', isAuthenticated, '| nav screen=', state.screen, '| showSplash=', showSplash);
+
+  /* The background / killed order alert is generic by design, so a tap has one
+     meaning: show the pending orders. AppContent owns the only navigation
+     state, and the history survives restarts, so the tap must navigate
+     explicitly instead of hoping the remembered screen is Orders.
+       app alive   → native pushes "NotificationOpenOrders" → this handler
+       cold start  → MainActivity stashes the flag → pulled once per session */
+  useEffect(() => {
+    if (!isAuthenticated) {
+      removeOpenOrdersHandler();
+      return;
+    }
+    const openOrders = () => {
+      console.log('[ORDER-TAP] Opening Orders screen from notification tap');
+      navigate('orders');
+    };
+    setOpenOrdersHandler(openOrders);
+    consumePendingOrdersNavigation().then(pending => {
+      if (pending) openOrders();
+    });
+    return () => removeOpenOrdersHandler();
+  }, [isAuthenticated, navigate]);
 
   /* FCM bootstrap for EVERY authenticated session — including sessions
      restored on app restart, where LoginScreen is never mounted.

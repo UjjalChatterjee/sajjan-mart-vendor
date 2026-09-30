@@ -35,7 +35,8 @@ const mockGetNotificationSoundEnabled = jest.fn(async () => mockSoundStore.enabl
 const mockSetNotificationSoundEnabled = jest.fn((enabled: boolean) => {
   mockSoundStore.enabled = enabled;
 });
-const mockVibrateOrderAlert = jest.fn();
+const mockStartOrderAlertVibration = jest.fn();
+const mockStopOrderAlertVibration = jest.fn();
 const mockStartForegroundSound = jest.fn();
 const mockStopForegroundSound = jest.fn();
 const mockStartOrderAlert = jest.fn();
@@ -49,7 +50,8 @@ jest.mock('react-native', () => ({
       getNotificationSoundEnabled: () => mockGetNotificationSoundEnabled(),
       setNotificationSoundEnabled: (enabled: boolean) =>
         mockSetNotificationSoundEnabled(enabled),
-      vibrateOrderAlert: () => mockVibrateOrderAlert(),
+      startOrderAlertVibration: () => mockStartOrderAlertVibration(),
+      stopOrderAlertVibration: () => mockStopOrderAlertVibration(),
       startForegroundSound: () => mockStartForegroundSound(),
       stopForegroundSound: () => mockStopForegroundSound(),
       startOrderAlert: (...args: unknown[]) => mockStartOrderAlert(...args),
@@ -114,6 +116,7 @@ import {
   startOrderAlertSound,
   stopOrderAlertSound,
 } from '../src/services/sound.service';
+import { stopOrderVibration } from '../src/services/orderVibration';
 import * as alertSync from '../src/services/orderAlertSync';
 import * as notificationService from '../src/services/notification.service';
 
@@ -158,9 +161,11 @@ function raiseForegroundAlert(orderId: string): void {
 /* ── Setup / teardown ───────────────────────────────────────────────────── */
 
 beforeEach(() => {
-  // sound.service holds the order it is ringing for in module state; cleared
-  // first so one test's alert cannot dedupe the next test's one away.
+  // sound.service and orderVibration hold their order in module state; released
+  // before the counters are cleared so one test's alert cannot dedupe the next
+  // test's one away and no teardown call is counted as a result.
   stopOrderAlertSound();
+  alertSync.resetOrderAlertState();
   jest.clearAllMocks();
   mockSoundStore.enabled = true;
   mockBackgroundHandler = null;
@@ -170,7 +175,6 @@ beforeEach(() => {
   notificationService.removeIncomingOrderHandler();
   // A fresh JS runtime: cache back to the default, store untouched.
   soundPreference.resetNotificationSoundPreferenceForTests();
-  alertSync.resetOrderAlertState();
 });
 
 describe('1 — default is ON', () => {
@@ -208,7 +212,7 @@ describe('2 — OFF disables sound, never vibration', () => {
     raiseForegroundAlert(ORDER_A);
 
     expect(mockStartForegroundSound).not.toHaveBeenCalled();
-    expect(mockVibrateOrderAlert).toHaveBeenCalledTimes(1);
+    expect(mockStartOrderAlertVibration).toHaveBeenCalledTimes(1);
   });
 
   it('records the alert so the modal and cleanup still see it', async () => {
@@ -232,7 +236,7 @@ describe('3 — ON enables sound and vibration', () => {
     raiseForegroundAlert(ORDER_A);
 
     expect(mockStartForegroundSound).toHaveBeenCalledTimes(1);
-    expect(mockVibrateOrderAlert).toHaveBeenCalledTimes(1);
+    expect(mockStartOrderAlertVibration).toHaveBeenCalledTimes(1);
   });
 
   it('re-enabling after OFF restores audio', async () => {
@@ -260,7 +264,7 @@ describe('4 — the preference persists', () => {
 
     raiseForegroundAlert(ORDER_A);
     expect(mockStartForegroundSound).not.toHaveBeenCalled();
-    expect(mockVibrateOrderAlert).toHaveBeenCalledTimes(1);
+    expect(mockStartOrderAlertVibration).toHaveBeenCalledTimes(1);
   });
 
   it('is stored in exactly one place — nothing written to AsyncStorage', async () => {
@@ -286,7 +290,7 @@ describe('5 — background alert respects Sound OFF', () => {
     // JS playback is never started here, so the mute cannot be bypassed...
     expect(mockStartForegroundSound).not.toHaveBeenCalled();
     // ...and the JS haptic is skipped, because the notification already buzzes.
-    expect(mockVibrateOrderAlert).not.toHaveBeenCalled();
+    expect(mockStartOrderAlertVibration).not.toHaveBeenCalled();
   });
 
   it('never rings an order another device already decided', async () => {
@@ -296,7 +300,7 @@ describe('5 — background alert respects Sound OFF', () => {
     await mockBackgroundHandler!({ data: newOrderPayload(ORDER_A) });
 
     expect(mockStartOrderAlert).not.toHaveBeenCalled();
-    expect(mockVibrateOrderAlert).not.toHaveBeenCalled();
+    expect(mockStartOrderAlertVibration).not.toHaveBeenCalled();
   });
 });
 
@@ -333,25 +337,25 @@ describe('7 — one vibration per alert', () => {
     notificationService.routeOrderEventData(newOrderPayload(ORDER_A), 'foreground');
     notificationService.routeOrderEventData(newOrderPayload(ORDER_A), 'foreground');
 
-    expect(mockVibrateOrderAlert).toHaveBeenCalledTimes(1);
+    expect(mockStartOrderAlertVibration).toHaveBeenCalledTimes(1);
   });
 
   it('vibrates once per distinct order', () => {
     notificationService.routeOrderEventData(newOrderPayload(ORDER_A), 'foreground');
     notificationService.routeOrderEventData(newOrderPayload(ORDER_B), 'foreground');
 
-    expect(mockVibrateOrderAlert).toHaveBeenCalledTimes(2);
+    expect(mockStartOrderAlertVibration).toHaveBeenCalledTimes(2);
   });
 
   it('does not buzz for a status event or a tapped notification re-open', () => {
     notificationService.routeOrderEventData(newOrderPayload(ORDER_A), 'foreground');
-    expect(mockVibrateOrderAlert).toHaveBeenCalledTimes(1);
+    expect(mockStartOrderAlertVibration).toHaveBeenCalledTimes(1);
 
     notificationService.routeOrderEventData(statusPayload(ORDER_A, 'ACCEPTED'), 'foreground');
     notificationService.routeOrderEventData(newOrderPayload(ORDER_A), 'background');
     notificationService.routeOrderEventData(newOrderPayload(ORDER_A), 'opened');
 
-    expect(mockVibrateOrderAlert).toHaveBeenCalledTimes(1);
+    expect(mockStartOrderAlertVibration).toHaveBeenCalledTimes(1);
   });
 
   it('stays silent for an order that was already decided before its push landed', () => {
@@ -359,7 +363,7 @@ describe('7 — one vibration per alert', () => {
 
     notificationService.routeOrderEventData(newOrderPayload(ORDER_A), 'foreground');
 
-    expect(mockVibrateOrderAlert).not.toHaveBeenCalled();
+    expect(mockStartOrderAlertVibration).not.toHaveBeenCalled();
     expect(mockStartForegroundSound).not.toHaveBeenCalled();
   });
 });

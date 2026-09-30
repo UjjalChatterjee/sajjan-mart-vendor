@@ -15,8 +15,8 @@
  *      must never resurface as pending, even if its NEW_ORDER push lands after
  *      the status push),
  *   3. the local cleanup applied when an order is decided — stop this order's
- *      sound, close its modal (via subscribers), cancel its notification by the
- *      order-derived id, and patch the ['orders'] cache.
+ *      sound and repeating vibration, close its modal (via subscribers), cancel
+ *      its notification by the order-derived id, and patch the ['orders'] cache.
  *
  * Notification cancellation deliberately goes through the native
  * `dismissNotification(orderId)` bridge, which cancels the deterministic
@@ -29,6 +29,11 @@ import { NativeModules, Platform } from 'react-native';
 import { queryClient } from './queryClient';
 import { getOrders } from './order.service';
 import { getActiveAlertOrderId, stopOrderAlertSound } from './sound.service';
+import {
+  getVibratingOrderId,
+  startOrderVibration,
+  stopOrderVibration,
+} from './orderVibration';
 import type { Order, OrderStatus } from '../types';
 
 /* ── Types ── */
@@ -154,6 +159,7 @@ export function claimNewOrderAlert(
 
 /** Forget every tracked alert and decision (sign-out / test isolation). */
 export function resetOrderAlertState(): void {
+  stopOrderVibration();
   activeAlerts.clear();
   decidedOrders.clear();
 }
@@ -254,6 +260,17 @@ export function applyOrderDecision(
     } catch {
       // The service may already be stopped — nothing to clean up.
     }
+  }
+
+  // Same ownership rule for the repeating vibration: silence it only when this
+  // order owns the loop or nothing else is alerting. When another order is still
+  // pending, the loop is re-targeted instead of stopped, so the vendor keeps
+  // feeling one continuous alert and never a gap.
+  const vibrationBelongsToOrder = getVibratingOrderId() === orderId;
+  if (vibrationBelongsToOrder || activeAlerts.size === 0) {
+    const nextAlert = activeAlertsSnapshot()[0];
+    if (nextAlert) startOrderVibration(nextAlert.orderId);
+    else stopOrderVibration();
   }
 
   cancelOrderNotification(orderId);

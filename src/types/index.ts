@@ -9,6 +9,10 @@ export interface OrderItem {
   total: number;
   ready: boolean;
   cancelled: boolean;
+  /** 'product' | 'puja' | 'food' — 'food' is what makes an order cookable. */
+  itemType?: string;
+  /** order_items.product.product_type: the live marker behind the snapshot. */
+  productType?: string;
 }
 
 export type OrderStatus =
@@ -71,6 +75,10 @@ export interface Order {
   paymentStatus?: string;
   /** Item ids for which cancellation was explicitly requested (status = cancel_request). */
   cancel_request_items?: string[];
+  /** Food preparation timer. All three are written by the server on accept. */
+  preparationTimeMinutes?: number;
+  acceptedAt?: string;
+  preparationDueAt?: string;
 }
 
 export type Screen = 'login' | 'register' | 'orders' | 'notifications' | 'settings';
@@ -98,6 +106,9 @@ export interface BackendOrderItem {
   ready?: boolean;
   cancelled?: boolean;
   refunded?: boolean;
+  item_type?: string;
+  /** The linked product record, when the item still points at one. */
+  product?: { product_type?: string } | null;
 }
 
 export interface BackendOrder {
@@ -120,6 +131,9 @@ export interface BackendOrder {
   cancel_reason?: string | null;
   previous_status?: string | null;
   refunded_amount?: number | null;
+  preparation_time_minutes?: number | null;
+  accepted_at?: string | null;
+  preparation_due_at?: string | null;
   created_at: string;
   updated_at: string;
   user?: BackendOrderUser;

@@ -18,15 +18,21 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import org.json.JSONArray
-import org.json.JSONObject
 
 /**
- * Foreground Service that plays alert.mp3 in a continuous loop.
+ * Foreground Service that owns the background / killed order alert.
  *
- * The persistent notification shows full order details with
- * REJECT / ACCEPT actions so the store staff can act directly
- * from the notification even when the app is in the background or killed.
+ * Two continuous things, until the order is decided on ANY device:
+ *   - alert.mp3 looped through MediaPlayer, gated by the "Notification Sound"
+ *     preference (audio only)
+ *   - the repeating haptic, through the single OrderVibration owner — never
+ *     gated, because Sound OFF means a silent alert, not an invisible one
+ *
+ * The notification itself is deliberately generic: "Sajjan Mart" / "1 New
+ * Order", no customer, phone, address, amount, items or order id, and NO action
+ * buttons. A notification outlives the app on the shade and the lock screen, so
+ * it carries nothing a stranger could read. Deciding an order happens in the
+ * app: tapping the notification opens the Orders screen.
  *
  * This service is fully native — no React Native dependency.
  * It is started by:
@@ -39,26 +45,72 @@ class OrderAlertService : Service() {
         private const val TAG = "OrderAlertService"
 
         /**
-         * Legacy fixed notification id kept only so a service notification posted
-         * by an older build can still be cleared. New alerts use
-         * NotificationHelperModule.notificationIdFor(orderId) — the same id the JS
-         * path uses — so a single ORDER_STATUS_UPDATED can dismiss exactly the
-         * order it refers to.
+         * The generic order-alert notification id — ONE entry for the service,
+         * whatever the number of pending orders behind it.
+         *
+         * It used to be a legacy fixed id kept only so an older build's
+         * notification could still be cleared. Now it is deliberate: the
+         * notification no longer describes a specific order, so it has no
+         * order-derived id, and `notificationIdFor(orderId)` is still cancelled
+         * for a resolved order so an alert posted by an older build cannot
+         * linger.
          */
         const val NOTIFICATION_ID = 9999
         private const val ACTION_STOP = "com.sajjanmart.ALERT_STOP"
 
-        // Intent extras
-        private const val EXTRA_ORDER_ID      = "order_id"
-        private const val EXTRA_ORDER_NUMBER  = "order_number"
-        private const val EXTRA_CUSTOMER_NAME = "customer_name"
-        private const val EXTRA_CUSTOMER_PHONE = "customer_phone"
-        private const val EXTRA_ADDRESS       = "address"
-        private const val EXTRA_TOTAL         = "total"
-        private const val EXTRA_PAYMENT_METHOD = "payment_method"
-        private const val EXTRA_PAYMENT_STATUS = "payment_status"
-        private const val EXTRA_ITEMS_JSON    = "items_json"
-        private const val EXTRA_ITEM_COUNT    = "item_count"
+        /** Exact, order-free notification copy. */
+        private const val NOTIFICATION_TITLE = "Sajjan Mart"
+        private const val NOTIFICATION_BODY_SINGLE = "1 New Order"
+
+        /** The one tap target of the alert notification. */
+        private const val TAP_REQUEST_CODE = 4700
+
+        /** Upper bound on the pending-order count the alert tracks. */
+        private const val PENDING_LIMIT = 20
+
+        @JvmStatic
+        fun notificationBody(pendingCount: Int): String =
+            if (pendingCount <= 1) NOTIFICATION_BODY_SINGLE else "$pendingCount New Orders"
+
+        // Intent extras — only the order id travels. The alert notification is
+        // generic by design, so customer / payment / address data is never put
+        // into an intent that ends up inside a lock-screen notification.
+        private const val EXTRA_ORDER_ID = "order_id"
+
+        /**
+         * Orders this device is currently alerting for while the service runs.
+         *
+         * The generic notification counts them ("1 New Order" / "3 New Orders")
+         * and the alert only ends when the last one is decided somewhere, so a
+         * second push can neither start a second siren nor make the first one
+         * disappear.
+         */
+        private val pendingOrderIds = LinkedHashSet<String>()
+
+        @Synchronized
+        private fun snapshotPending(): List<String> = pendingOrderIds.toList()
+
+        @Synchronized
+        private fun addPending(orderId: String): Int {
+            pendingOrderIds.add(orderId)
+            // Bound it: an unwatched store could otherwise accumulate forever.
+            while (pendingOrderIds.size > PENDING_LIMIT) {
+                val oldest = pendingOrderIds.iterator().next()
+                pendingOrderIds.remove(oldest)
+            }
+            return pendingOrderIds.size
+        }
+
+        @Synchronized
+        private fun removePending(orderId: String): Int {
+            pendingOrderIds.remove(orderId)
+            return pendingOrderIds.size
+        }
+
+        @Synchronized
+        private fun clearPending() {
+            pendingOrderIds.clear()
+        }
 
         /** Mutable shared audio-state snapshot used only as a best-effort restore path when
          *  OrderAlertService.stop(context) is called without a live instance (for example after the
@@ -95,22 +147,21 @@ class OrderAlertService : Service() {
             } catch (_: Exception) {}
         }
 
-        /** Start the order alert service with full order details.
-         *  Safe to call multiple times — duplicate starts are ignored by the
-         *  isPlaying guard in startPlayback(). */
-        fun start(
-            context: Context,
-            orderId: String,
-            orderNumber: String = orderId,
-            customerName: String = "",
-            customerPhone: String = "",
-            address: String = "",
-            total: String = "",
-            paymentMethod: String = "",
-            paymentStatus: String = "",
-            itemsJson: String = "[]",
-            itemCount: String = "",
-        ) {
+        /**
+         * Start (or extend) the native order alert for [orderId].
+         *
+         * Safe to call multiple times: a repeat start re-posts the same generic
+         * notification with its new count, and the running siren / haptic are
+         * never duplicated — the MediaPlayer guards on `isPlaying`, and
+         * [OrderVibration] holds one hardware loop per owner.
+         */
+        @JvmStatic
+        fun start(context: Context, orderId: String) {
+            if (orderId.isBlank() || orderId == "unknown") {
+                Log.w(TAG, "[ORDER-ALERT] start called without a usable order id — skipped")
+                return
+            }
+
             // An order this device already decided must never ring again — this
             // covers the status push arriving before (or instead of) the NEW_ORDER.
             if (OrderDecisionStore.isResolved(context, orderId)) {
@@ -118,17 +169,10 @@ class OrderAlertService : Service() {
                 return
             }
 
+            // Only the order id goes into the intent. The alert notification is
+            // generic, so customer / payment / address data never travels with it.
             val intent = Intent(context, OrderAlertService::class.java).apply {
-                putExtra(EXTRA_ORDER_ID,       orderId)
-                putExtra(EXTRA_ORDER_NUMBER,   orderNumber)
-                putExtra(EXTRA_CUSTOMER_NAME,  customerName)
-                putExtra(EXTRA_CUSTOMER_PHONE, customerPhone)
-                putExtra(EXTRA_ADDRESS,        address)
-                putExtra(EXTRA_TOTAL,          total)
-                putExtra(EXTRA_PAYMENT_METHOD, paymentMethod)
-                putExtra(EXTRA_PAYMENT_STATUS, paymentStatus)
-                putExtra(EXTRA_ITEMS_JSON,     itemsJson)
-                putExtra(EXTRA_ITEM_COUNT,     itemCount)
+                putExtra(EXTRA_ORDER_ID, orderId)
             }
             context.startForegroundService(intent)
         }
@@ -147,40 +191,66 @@ class OrderAlertService : Service() {
          * Resolve an order that was decided elsewhere (ORDER_STATUS_UPDATED) or
          * by this device.
          *
-         * Stops the looping siren only when this order owns it, then cancels
-         * exactly this order's notification id. Another order's alert is never
-         * touched, so a multi-order tray keeps its pending entries.
+         * The alert is shared: it ends only when the LAST pending order is gone.
+         * While another order is still undecided the siren and the repeating
+         * haptic keep running and the generic notification is re-posted with the
+         * new count, so one device's decision can never silence another order's
+         * alert.
          */
         @JvmStatic
         fun handleOrderResolved(context: Context, orderId: String) {
             if (orderId.isBlank() || orderId == "unknown") return
 
+            val remaining = removePending(orderId)
             val ownsAlert = activeOrderId == orderId
-            if (ownsAlert) {
+
+            if (remaining == 0) {
+                // Nothing left to alert for — siren, haptic and notification end.
                 stop(context)
+                cancelAlertNotification(context)
+            } else {
+                if (ownsAlert) {
+                    // The alert bundle belongs to the alert, not to the order that
+                    // just settled. Hand it to a still-pending order.
+                    activeOrderId = snapshotPending().firstOrNull()
+                }
+                instance?.repostAlertNotification()
+                // A notification posted by an older build carries this order's id.
+                cancelNotification(context, NotificationHelperModule.notificationIdFor(orderId))
             }
 
+            Log.d(
+                TAG,
+                "[ORDER-ALERT] Resolved order $orderId (ownsAlert=$ownsAlert, remaining=$remaining)",
+            )
+        }
+
+        @JvmStatic
+        private fun cancelNotification(context: Context, id: Int) {
             try {
                 val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                nm.cancel(NotificationHelperModule.notificationIdFor(orderId))
-                if (ownsAlert) {
-                    // Only ours: never cancel another app's or another alert's entry.
-                    nm.cancel(NOTIFICATION_ID)
-                }
-                Log.d(TAG, "[ORDER-ALERT] Resolved order $orderId (ownsAlert=$ownsAlert)")
+                nm.cancel(id)
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to cancel notification for resolved order $orderId", e)
+                Log.e(TAG, "Failed to cancel notification id $id", e)
             }
         }
 
+        @JvmStatic
+        private fun cancelAlertNotification(context: Context) {
+            // Ours only: never cancels another app's or another alert's entry.
+            cancelNotification(context, NOTIFICATION_ID)
+        }
+
         /**
-         * Silence the siren for an order WITHOUT cancelling its notification.
+         * Silence the alert (siren + haptic) for an order WITHOUT cancelling its
+         * notification.
          *
          * Used the instant a notification action button is tapped: the loop must
          * stop on the fingertip, but the order has not been decided yet. If the
-         * backend call then fails, the notification (with its working ACCEPT /
-         * REJECT buttons) is still in the tray, so the alert stays recoverable
-         * instead of vanishing on an unconfirmed decision.
+         * backend call then fails, the notification is still in the tray, so the
+         * alert stays recoverable instead of vanishing on an unconfirmed decision.
+         * (The current alert notification carries no buttons — this stays for any
+         * actionable notification the app posts again.)
          *
          * Only the order that owns the live alert can silence it — another
          * pending order keeps ringing.
@@ -194,6 +264,7 @@ class OrderAlertService : Service() {
             }
 
             instance?.stopPlayback()
+            OrderVibration.stop(context, OrderVibration.OWNER_SERVICE)
             activeOrderId = null
             // stopService → onDestroy → stopForeground(DETACH): the looping audio
             // and the foreground-service state end, the notification survives.
@@ -203,15 +274,18 @@ class OrderAlertService : Service() {
                 Log.w(TAG, "[ORDER-ALERT] Could not stop the service cleanly: ${e.message}")
             }
             restoreSharedStreamState(context)
-            Log.d(TAG, "[ORDER-ALERT] Siren silenced for $orderId, notification kept")
+            Log.d(TAG, "[ORDER-ALERT] Alert silenced for $orderId, notification kept")
         }
 
-        /** Stop the order alert service and release audio immediately.
+        /** Stop the order alert service: release audio, stop the repeating haptic
+         *  and forget the pending set.
          *  Safe to call multiple times from any thread or receiver. */
         @JvmStatic
         fun stop(context: Context) {
             // Immediate in-memory stop for 0ms latency on ACCEPT/REJECT
             instance?.stopPlayback()
+            OrderVibration.stop(context, OrderVibration.OWNER_SERVICE)
+            clearPending()
             activeOrderId = null
 
             try {
@@ -240,23 +314,6 @@ class OrderAlertService : Service() {
             sharedStreamStateCaptured = true
         }
 
-        /** Map raw FCM paymentMethod values to human-readable labels.
-         *   "cod"       -> "Cash on Delivery"
-         *   "online"    -> "Online Payment"
-         *   "upi"       -> "UPI"
-         *  Package-level accessible so NotificationHelperModule can call it as
-         *  OrderAlertService.friendlyPaymentMethod(...). */
-        @JvmStatic
-        fun friendlyPaymentMethod(raw: String): String = when (raw.lowercase().trim()) {
-            "cod"        -> "Cash on Delivery"
-            "online"     -> "Online Payment"
-            "upi"        -> "UPI"
-            "card"       -> "Card"
-            "netbanking" -> "Net Banking"
-            "wallet"     -> "Wallet"
-            else         -> raw.replaceFirstChar { it.uppercase() }
-        }
-
         /**
          * Single source of truth for the order alert notification channel.
          * Both OrderAlertService and NotificationHelperModule must use this.
@@ -265,8 +322,15 @@ class OrderAlertService : Service() {
          *   IMPORTANCE_HIGH  → heads-up display, interruptive on active screen
          *   setBypassDnd     → request DND bypass (requires ACCESS_NOTIFICATION_POLICY + user grant)
          *   setSound(null)   → MediaPlayer handles audio via USAGE_ALARM (bypasses DND on most devices)
-         *   vibration         → triple-buzz pattern for urgency
-         *   VISIBILITY_PUBLIC → full detail on lock screen
+         *   vibration         → one-shot triple buzz PER POST. A channel cannot loop,
+         *                       and posting replaces whatever the motor is doing, so
+         *                       this is only the first touch of an alert — the
+         *                       repeating haptic is owned by OrderVibration, which
+         *                       re-dispatches the loop right after every post.
+         *   lockscreenVisibility → app-writable settings only. Importance and
+         *                       lock-screen visibility are frozen at channel creation
+         *                       (an installed device keeps PUBLIC), which is safe now
+         *                       because the notification text is generic.
          *  Package-level accessible so NotificationHelperModule can call it as
          *  OrderAlertService.ensureNotificationChannel(...). */
         @JvmStatic
@@ -381,54 +445,89 @@ class OrderAlertService : Service() {
         if (intent?.action == ACTION_STOP) {
             Log.d(TAG, "Stop action received")
             stopPlayback()
+            OrderVibration.stop(applicationContext, OrderVibration.OWNER_SERVICE)
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY
         }
 
-        val orderId       = intent?.getStringExtra(EXTRA_ORDER_ID)       ?: "unknown"
-        val orderNumber   = intent?.getStringExtra(EXTRA_ORDER_NUMBER)   ?: orderId
-        val customerName  = intent?.getStringExtra(EXTRA_CUSTOMER_NAME)  ?: ""
-        val customerPhone = intent?.getStringExtra(EXTRA_CUSTOMER_PHONE) ?: ""
-        val address       = intent?.getStringExtra(EXTRA_ADDRESS)        ?: ""
-        val total         = intent?.getStringExtra(EXTRA_TOTAL)          ?: ""
-        val paymentMethod = intent?.getStringExtra(EXTRA_PAYMENT_METHOD) ?: ""
-        val paymentStatus = intent?.getStringExtra(EXTRA_PAYMENT_STATUS) ?: ""
-        val itemsJson     = intent?.getStringExtra(EXTRA_ITEMS_JSON)     ?: "[]"
-        val itemCount     = intent?.getStringExtra(EXTRA_ITEM_COUNT)     ?: ""
+        val orderId = intent?.getStringExtra(EXTRA_ORDER_ID)
+        if (orderId.isNullOrBlank() || orderId == "unknown") {
+            Log.w(TAG, "[ORDER-ALERT] start without a usable order id — stopping")
+            stopSelf()
+            return START_NOT_STICKY
+        }
 
-        Log.d(TAG, "[ORDER-ALERT] starting for order: $orderId")
+        // A START_STICKY redelivery can land after the order was decided, so the
+        // decided set is checked here too, not only at start().
+        if (OrderDecisionStore.isResolved(this, orderId)) {
+            Log.d(TAG, "[ORDER-ALERT] Order $orderId is already decided — not re-alerting")
+            if (snapshotPending().isEmpty()) stopSelf()
+            return START_NOT_STICKY
+        }
+
+        val pendingCount = addPending(orderId)
+        // One siren owner: a second pending order must not steal the alert from
+        // the order that is already ringing.
+        if (activeOrderId == null) activeOrderId = orderId
+
+        Log.d(TAG, "[ORDER-ALERT] starting for order: $orderId (pending=$pendingCount)")
 
         try {
-            // Same deterministic id the JS layer uses for this order, so both
-            // paths post ONE notification per order instead of duplicating it —
-            // and dismissing one order's alert can never hit another's.
-            val notifId = NotificationHelperModule.notificationIdFor(orderId)
-            activeOrderId = orderId
-
-            val notification = buildForegroundNotification(
-                orderId, orderNumber, customerName, customerPhone,
-                address, total, paymentMethod, paymentStatus, itemsJson, itemCount,
-            )
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(
-                    notifId,
-                    notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
-                )
-            } else {
-                startForeground(notifId, notification)
-            }
-            Log.d(TAG, "[ORDER-ALERT] notification created (id=$notifId)")
+            // ONE generic notification for the service. It names no order, so a
+            // repeat push just re-posts it with a new count instead of stacking a
+            // second entry, and cancelling it can never hit another app.
+            val notification = buildAlertNotification(pendingCount)
+            startAlertForeground(notification)
             startPlayback()
+            /*
+             * The repeating haptic is started OUTSIDE the sound switch that gates
+             * startPlayback(): Sound OFF mutes the siren, it never mutes the
+             * vibration. It is dispatched after the post because a notification
+             * runs the channel's one-shot burst, which replaces whatever the
+             * motor was doing — re-asserting here is what keeps the loop alive.
+             */
+            OrderVibration.start(applicationContext, OrderVibration.OWNER_SERVICE)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start foreground service or playback", e)
-            activeOrderId = null
+            removePending(orderId)
+            if (activeOrderId == orderId) activeOrderId = snapshotPending().firstOrNull()
+            OrderVibration.stop(applicationContext, OrderVibration.OWNER_SERVICE)
             stopSelf()
             return START_NOT_STICKY
         }
 
         return START_STICKY
+    }
+
+    /**
+     * Promote this service to the foreground with the generic alert
+     * notification. mediaPlayback is the declared type because the service's
+     * foreground work is the looping alert sound.
+     */
+    private fun startAlertForeground(notification: Notification) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+        Log.d(TAG, "[ORDER-ALERT] alert notification posted (id=$NOTIFICATION_ID)")
+    }
+
+    /**
+     * Re-post the generic notification when the pending count changed — an order
+     * was decided somewhere else while another one is still awaiting a decision.
+     */
+    fun repostAlertNotification() {
+        try {
+            startAlertForeground(buildAlertNotification(snapshotPending().size))
+        } catch (e: Exception) {
+            Log.w(TAG, "[ORDER-ALERT] Could not re-post the alert notification: ${e.message}")
+        }
     }
 
     override fun onDestroy() {
@@ -437,9 +536,12 @@ class OrderAlertService : Service() {
             instance = null
         }
         stopPlayback()
+        // The service's own claim on the haptic ends here. OrderVibration keeps
+        // vibrating if the app itself is still alerting (OWNER_JS).
+        OrderVibration.stop(applicationContext, OrderVibration.OWNER_SERVICE)
         // DETACH — keep the notification visible so the user can see what happened
-        // even after the service exits. It carries this order's deterministic id,
-        // so the app (or a later ORDER_STATUS_UPDATED) can cancel exactly it.
+        // even after the service exits. It is the generic alert entry, so the app
+        // (or a later ORDER_STATUS_UPDATED) cancels it by NOTIFICATION_ID.
         try { stopForeground(STOP_FOREGROUND_DETACH) } catch (_: Exception) {}
         restoreStreamVolume()
         releaseAudioFocus()
@@ -601,186 +703,58 @@ class OrderAlertService : Service() {
 
     // ── Notification Builder ──
 
-    private fun buildForegroundNotification(
-        orderId: String,
-        orderNumber: String,
-        customerName: String,
-        customerPhone: String,
-        address: String,
-        total: String,
-        paymentMethod: String,
-        paymentStatus: String,
-        itemsJson: String,
-        itemCountRaw: String,
-    ): Notification {
-
-        // ── Parse items ────────────────────────────────────────────────────────
-        val parsedItems = parseItemsArray(itemsJson)
-
-        // Prefer the explicit FCM itemCount value; fall back to counting the array.
-        val itemCount: Int = itemCountRaw.toIntOrNull()?.takeIf { it >= 0 }
-            ?: parsedItems.size
-
-        val itemCountLabel = when (itemCount) {
-            0    -> "No items"
-            1    -> "1 item"
-            else -> "$itemCount items"
-        }
-
-        // ── Payment label ──────────────────────────────────────────────────────
-        val paymentLabel = friendlyPaymentMethod(paymentMethod)
-
-        // ── PendingIntents ─────────────────────────────────────────────────────
-        // Every code is mixed with the order id (multiplication, not `or`) so two
-        // orders can never share a target and have FLAG_UPDATE_CURRENT rewrite the
-        // other one's button.
-        fun requestCode(offset: Int): Int = 0x7FFFFFFF and (31 * orderId.hashCode() + offset)
-
-        val acceptIntent = Intent(this, NotificationActionReceiver::class.java).apply {
-            action = NotificationHelperModule.ACTION_ACCEPT
-            putExtra(NotificationHelperModule.EXTRA_ORDER_ID, orderId)
-            putExtra(NotificationHelperModule.EXTRA_ACTION, NotificationHelperModule.ACTION_ACCEPT)
-            putExtra("orderNumber", orderNumber)
-        }
-        val acceptPending = PendingIntent.getBroadcast(
-            this,
-            NotificationHelperModule.actionRequestCode(orderId, NotificationHelperModule.ACTION_ACCEPT),
-            acceptIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-
-        val rejectIntent = Intent(this, NotificationActionReceiver::class.java).apply {
-            action = NotificationHelperModule.ACTION_REJECT
-            putExtra(NotificationHelperModule.EXTRA_ORDER_ID, orderId)
-            putExtra(NotificationHelperModule.EXTRA_ACTION, NotificationHelperModule.ACTION_REJECT)
-            putExtra("orderNumber", orderNumber)
-        }
-        val rejectPending = PendingIntent.getBroadcast(
-            this,
-            NotificationHelperModule.actionRequestCode(orderId, NotificationHelperModule.ACTION_REJECT),
-            rejectIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
+    /**
+     * The generic order-alert notification.
+     *
+     * Exactly two strings, no order data:
+     *   title  "Sajjan Mart"
+     *   body   "1 New Order" — or "3 New Orders" when more are pending
+     *
+     * Deliberately absent: customer name, phone, products, amount, address and
+     * order id, plus the ACCEPT / REJECT action buttons. This entry outlives the
+     * app in the shade and on the lock screen, and a store device is not a
+     * private place. Deciding an order happens in the app: tapping the
+     * notification opens it on the Orders screen.
+     *
+     * No full-screen intent either — that would auto-launch order UI over a
+     * locked screen.
+     */
+    private fun buildAlertNotification(pendingCount: Int): Notification {
+        val body = notificationBody(pendingCount)
 
         val tapIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
-            putExtra(EXTRA_ORDER_ID, orderId)
+            putExtra(NotificationHelperModule.EXTRA_OPEN_ORDERS, true)
         }
+        // One stable request code: the tap target never varies, so a re-post can
+        // never leave an old PendingIntent pointing somewhere else.
         val tapPending = PendingIntent.getActivity(
             this,
-            requestCode(0x30000),
-            tapIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-        // Full-screen intent fires when device is locked / screen off.
-        val fullScreenPending = PendingIntent.getActivity(
-            this,
-            requestCode(0x40000),
+            TAP_REQUEST_CODE,
             tapIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 
-        // ── Collapsed text (single line shown when notification is not expanded) ─
-        val contentText = buildString {
-            append("Order #$orderNumber")
-            if (customerName.isNotEmpty())  append(" • $customerName")
-            if (total.isNotEmpty())         append(" • ₹$total")
-            if (paymentMethod.isNotEmpty()) append(" ($paymentLabel)")
-            if (itemCount > 0)             append(" • $itemCountLabel")
-        }
-
-        // ── Expanded text (BigTextStyle — shown when notification is pulled down) ─
-        val bigText = buildString {
-            append("Order Number: #$orderNumber\n")
-            if (customerName.isNotEmpty()) {
-                append("Customer: $customerName\n")
-            }
-            if (customerPhone.isNotEmpty()) {
-                append("Phone: $customerPhone\n")
-            }
-            if (total.isNotEmpty()) {
-                append("Total Amount: ₹$total\n")
-            }
-            if (paymentMethod.isNotEmpty()) {
-                val statusText = if (paymentStatus.isNotEmpty() &&
-                        paymentStatus != "pending" &&
-                        paymentStatus != "cod") " (${paymentStatus.replaceFirstChar { it.uppercase() }})" else ""
-                append("Payment Method: $paymentLabel$statusText\n")
-            }
-            append("Items: $itemCountLabel\n")
-
-            // Important item/order details
-            if (parsedItems.isNotEmpty()) {
-                append("\nItems Detail:\n")
-                for (row in parsedItems) {
-                    append("  • ${row.name} × ${row.qty}")
-                    if (row.lineTotal > 0) {
-                        append(" (₹${row.lineTotal})")
-                    }
-                    append("\n")
-                }
-            }
-
-            // Delivery address
-            if (address.isNotEmpty()) {
-                append("\nDelivery Address:\n$address")
-            }
-        }.trimEnd()
-
-        // ── Ticker ─────────────────────────────────────────────────────────────
-        val tickerText = buildString {
-            append("NEW ORDER #$orderNumber")
-            if (customerName.isNotEmpty()) append(" • $customerName")
-            if (total.isNotEmpty())        append(" • ₹$total")
-        }
-
-        // ── Build ──────────────────────────────────────────────────────────────
         return NotificationCompat.Builder(this, NotificationHelperModule.CHANNEL_ID)
-            // Identity
             .setSmallIcon(android.R.drawable.ic_dialog_alert)
             .setColor(0xFF16A34A.toInt())
             .setColorized(true)
-            .setContentTitle("NEW ORDER")
-            .setSubText("#$orderNumber")           // header area, right of app name
-            .setTicker(tickerText)                 // accessibility + lock-screen first glance
-            // Content
-            .setContentText(contentText)
-            .setStyle(
-                NotificationCompat.BigTextStyle()
-                    .bigText(bigText)
-                    .setBigContentTitle("NEW ORDER")
-                    .setSummaryText("#$orderNumber"),
-            )
-            // Urgency
-            .setPriority(NotificationCompat.PRIORITY_MAX)        // heads-up on active screen
-            .setCategory(NotificationCompat.CATEGORY_ALARM)      // bypass DnD
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC) // full detail on lock screen
-            .setFullScreenIntent(fullScreenPending, true)        // popup on sleeping screen
-            // Behaviour
-            .setOngoing(true)        // swipe-away blocked while service is alive
+            .setContentTitle(NOTIFICATION_TITLE)
+            .setContentText(body)
+            .setTicker(body)
+            // The entry still has to interrupt — that part is not sensitive.
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setCategory(NotificationCompat.CATEGORY_ALARM)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setOngoing(true)
             .setAutoCancel(false)
-            // One buzz per order. The same order id resolves to the same
-            // notification id, and both the native receiver and the JS runtime
-            // can post it — without this flag each re-post would re-run the
-            // channel vibration. The first post still alerts; updates are quiet.
+            // One buzz per order count change, not one per re-post.
             .setOnlyAlertOnce(true)
-            .setLocalOnly(true)      // don't forward to Wear OS
-            .setNumber(itemCount)    // badge count
-            .setSound(null)          // audio managed by MediaPlayer (USAGE_ALARM)
-            .setVibrate(null)        // channel vibration pattern handles it
-            // Tap
+            .setLocalOnly(true)
+            .setNumber(pendingCount)
+            .setSound(null)          // audio is MediaPlayer (USAGE_ALARM)
+            .setVibrate(null)        // channel burst + OrderVibration own the haptic
             .setContentIntent(tapPending)
-            // Action buttons — ACCEPT left, REJECT right
-            .addAction(
-                android.R.drawable.ic_menu_send,
-                "ACCEPT",
-                acceptPending,
-            )
-            .addAction(
-                android.R.drawable.ic_menu_close_clear_cancel,
-                "REJECT",
-                rejectPending,
-            )
             .build()
     }
 
@@ -950,42 +924,4 @@ class OrderAlertService : Service() {
         Log.d(TAG, "[ORDER-ALERT] Audio focus released")
     }
 
-    /** Structured item row parsed from the FCM items JSON array. */
-    data class ItemRow(val name: String, val qty: Int, val lineTotal: Int)
-
-    /**
-     * Parse the items JSON array from the FCM payload.
-     *
-     * Expected shape (matches lib/notifications.ts):
-     *   [{ name, quantity, price, unitPrice, total }, ...]
-     *
-     * Line total resolution order: total > price*qty > unitPrice*qty > 0
-     */
-    private fun parseItemsArray(itemsJson: String): List<ItemRow> {
-        return try {
-            val array = JSONArray(itemsJson)
-            (0 until array.length()).mapNotNull { i ->
-                val obj  = array.getJSONObject(i)
-                val name = obj.optString("name", "").trim()
-                if (name.isEmpty()) return@mapNotNull null
-
-                val qty = obj.optInt("quantity", 1).coerceAtLeast(1)
-
-                val lineTotal: Int = when {
-                    obj.has("total") && obj.optDouble("total", 0.0) > 0 ->
-                        obj.optDouble("total", 0.0).toInt()
-                    obj.has("price") && obj.optDouble("price", 0.0) > 0 ->
-                        (obj.optDouble("price", 0.0) * qty).toInt()
-                    obj.has("unitPrice") && obj.optDouble("unitPrice", 0.0) > 0 ->
-                        (obj.optDouble("unitPrice", 0.0) * qty).toInt()
-                    else -> 0
-                }
-
-                ItemRow(name, qty, lineTotal)
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to parse items JSON", e)
-            emptyList()
-        }
-    }
-}
+}

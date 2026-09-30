@@ -4,9 +4,10 @@
   "private": true,
 "scripts": {
   "android": "react-native run-android",
-  "android:debug": "cd android && gradlew.bat assembleDebug",
-  "android:debug:standalone": "react-native bundle --platform android --dev true --entry-file index.js --bundle-output android/app/src/debug/assets/index.android.bundle --assets-dest android/app/src/debug/res --reset-cache && cd android && gradlew.bat assembleDebug",
-  "android:debug:clean": "cd android && gradlew.bat clean && gradlew.bat assembleDebug",
+  "android:bundle": "react-native bundle --platform android --dev true --entry-file index.js --bundle-output android/app/src/debug/assets/index.android.bundle --assets-dest android/app/src/debug/res --reset-cache",
+  "android:debug": "npm run android:bundle && cd android && gradlew.bat assembleDebug",
+  "android:debug:standalone": "npm run android:bundle && cd android && gradlew.bat assembleDebug",
+  "android:debug:clean": "npm run android:bundle && cd android && gradlew.bat clean && gradlew.bat assembleDebug",
   "android:release": "cd android && gradlew.bat assembleRelease",
   "android:clean": "cd android && gradlew.bat clean",
   "android:release:clean": "cd android && gradlew.bat clean && gradlew.bat assembleRelease",

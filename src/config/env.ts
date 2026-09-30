@@ -21,8 +21,8 @@ import { Platform } from 'react-native';
  */
 const DEV_BASE_URL =
   Platform.OS === 'android'
-    ? 'http://192.168.0.108:3001'
-    : 'http://192.168.0.108:3001';
+    ? 'http://192.168.0.110:3000'
+    : 'http://192.168.0.110:3000';
 
 export const Env = {
   /** REST API base — no trailing slash */

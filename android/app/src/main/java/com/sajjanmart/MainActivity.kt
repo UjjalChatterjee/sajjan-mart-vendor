@@ -13,6 +13,14 @@ class MainActivity : ReactActivity() {
     /** order_id from the last NEW_ORDER notification tap, held until JS consumes it. */
     @Volatile
     var pendingTapOrderId: String? = null
+
+    /**
+     * Set by a tap on the generic order-alert notification: the JS router shows
+     * the Orders screen. Held until JS consumes it, because on a cold start the
+     * React context does not exist yet.
+     */
+    @Volatile
+    var pendingOrdersNavigation: Boolean = false
   }
 
   /**
@@ -31,11 +39,13 @@ class MainActivity : ReactActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     captureTapOrderId(intent)
+    captureOrdersNavigation(intent)
   }
 
   override fun onNewIntent(intent: Intent) {
     super.onNewIntent(intent)
     captureTapOrderId(intent)
+    captureOrdersNavigation(intent)
   }
 
   /**
@@ -48,5 +58,16 @@ class MainActivity : ReactActivity() {
 
     pendingTapOrderId = orderId
     NotificationHelperModule.instance?.emitTapToJS(orderId)
+  }
+
+  /**
+   * Generic order-alert notification tap: "open the app on the Orders screen".
+   * The notification carries no order data, so this is the whole signal.
+   */
+  private fun captureOrdersNavigation(intent: Intent?) {
+    if (intent?.getBooleanExtra(NotificationHelperModule.EXTRA_OPEN_ORDERS, false) != true) return
+
+    pendingOrdersNavigation = true
+    NotificationHelperModule.instance?.emitOrdersNavigationToJS()
   }
 }

@@ -34,6 +34,8 @@ function mapBackendItem(item: BackendOrderItem): OrderItem {
     total: Number(item.total) || 0,
     ready: item.ready === true,
     cancelled: item.cancelled === true,
+    itemType: item.item_type,
+    productType: item.product?.product_type,
   };
 }
 
@@ -115,6 +117,12 @@ function mapBackendOrder(raw: BackendOrder): Order {
     cancel_request_items: Array.isArray(raw.cancel_request_items)
       ? raw.cancel_request_items.map(String)
       : undefined,
+    preparationTimeMinutes:
+      typeof raw.preparation_time_minutes === 'number'
+        ? raw.preparation_time_minutes
+        : undefined,
+    acceptedAt: raw.accepted_at ?? undefined,
+    preparationDueAt: raw.preparation_due_at ?? undefined,
   };
 }
 
@@ -139,11 +147,22 @@ export async function getOrders(): Promise<Order[]> {
  * Accept an order.
  *
  * PUT /api/orders/{orderId}
- * Body: { "status": "confirmed" }
+ * Body: { "status": "confirmed", "preparation_time_minutes"?: number }
+ *
+ * The preparation time is only a request: the server clamps it, ignores it for
+ * non-food orders and derives `accepted_at` / `preparation_due_at` itself, so
+ * the deadline this device shows is the one it stored. Omit it (the card and
+ * notification paths) and the server uses its default.
  */
-export async function acceptOrder(orderId: string): Promise<void> {
+export async function acceptOrder(
+  orderId: string,
+  preparationTimeMinutes?: number,
+): Promise<void> {
   await apiPut(`/api/orders/${encodeURIComponent(orderId)}`, {
     status: 'confirmed',
+    ...(preparationTimeMinutes === undefined
+      ? {}
+      : { preparation_time_minutes: preparationTimeMinutes }),
   });
 }
 

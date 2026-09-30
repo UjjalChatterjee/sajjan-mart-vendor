@@ -27,7 +27,8 @@ var mockDismissNotification = jest.fn();
 var mockStopOrderAlert = jest.fn();
 var mockStartForegroundSound = jest.fn();
 var mockStopForegroundSound = jest.fn();
-var mockVibrateOrderAlert = jest.fn();
+var mockStartOrderAlertVibration = jest.fn();
+var mockStopOrderAlertVibration = jest.fn();
 var mockSetApiBaseUrl = jest.fn();
 var mockAcceptOrder = jest.fn();
 var mockRejectOrder = jest.fn();
@@ -40,7 +41,8 @@ jest.mock('react-native', () => ({
     NotificationHelper: {
       getNotificationSoundEnabled: jest.fn(async () => true),
       setNotificationSoundEnabled: jest.fn(),
-      vibrateOrderAlert: () => mockVibrateOrderAlert(),
+      startOrderAlertVibration: () => mockStartOrderAlertVibration(),
+      stopOrderAlertVibration: () => mockStopOrderAlertVibration(),
       startForegroundSound: () => mockStartForegroundSound(),
       stopForegroundSound: () => mockStopForegroundSound(),
       startOrderAlert: jest.fn(),
@@ -48,6 +50,7 @@ jest.mock('react-native', () => ({
       dismissNotification: (orderId: string) => mockDismissNotification(orderId),
       setApiBaseUrl: (url: string) => mockSetApiBaseUrl(url),
       getTappedOrderId: jest.fn(async () => null),
+      getPendingOrdersNavigation: jest.fn(async () => false),
     },
   },
   DeviceEventEmitter: { addListener: jest.fn(() => ({ remove: jest.fn() })) },
