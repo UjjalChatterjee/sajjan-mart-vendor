@@ -79,6 +79,32 @@ export interface Order {
   preparationTimeMinutes?: number;
   acceptedAt?: string;
   preparationDueAt?: string;
+  /** Written once by the server when the order leaves the kitchen. */
+  preparedAt?: string;
+  /** The server's own frozen preparation result — the authority every device reads. */
+  preparation?: PreparationSummary | null;
+}
+
+/**
+ * Frozen preparation result derived by the backend from its own timestamps.
+ *
+ * Whole seconds, not minutes: a kitchen that took 65 seconds is not a 1 minute
+ * kitchen and not a 2 minute kitchen.
+ */
+export interface PreparationSummary {
+  actualSeconds: number;
+  lateSeconds: number | null;
+}
+
+/**
+ * The deadline the server stamped while accepting, as it arrives in the accept
+ * response. Patching it into the cache is what lets the Processing card show the
+ * countdown at once; a device never composes these values itself.
+ */
+export interface PreparationTimerPatch {
+  preparationTimeMinutes?: number;
+  acceptedAt?: string;
+  preparationDueAt?: string;
 }
 
 export type Screen = 'login' | 'register' | 'orders' | 'notifications' | 'settings';
@@ -134,6 +160,9 @@ export interface BackendOrder {
   preparation_time_minutes?: number | null;
   accepted_at?: string | null;
   preparation_due_at?: string | null;
+  prepared_at?: string | null;
+  /** The backend's frozen preparation result, snake_case on the wire. */
+  preparation?: { actual_seconds: number; late_seconds: number | null } | null;
   created_at: string;
   updated_at: string;
   user?: BackendOrderUser;

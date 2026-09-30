@@ -49,7 +49,7 @@ import { showsPreparationTimer } from '../services/prepTimer';
 import { buildOrderFromNotification, mergeAlertOrder } from '../services/pushOrder';
 import { ErrorModal } from '../components/ErrorModal';
 import { CancelRequestOrderCard } from '../components/CancelRequestOrderCard';
-import type { Order } from '../types';
+import type { Order, PreparationTimerPatch } from '../types';
 
 /* ── Fixed tab system with status mapping ── */
 
@@ -314,12 +314,13 @@ export function OrdersScreen() {
       preparationMinutes?: number,
     ): Promise<boolean> => {
       try {
+        let timer: PreparationTimerPatch | null = null;
         if (outcome === 'ACCEPTED') {
-          await acceptOrder(orderId, preparationMinutes);
+          timer = await acceptOrder(orderId, preparationMinutes);
         } else {
           await rejectOrder(orderId);
         }
-        applyOrderDecision(orderId, outcome);
+        applyOrderDecision(orderId, outcome, timer);
         showSuccess(
           outcome === 'ACCEPTED'
             ? 'Order accepted successfully'

@@ -10,6 +10,8 @@ import {
   formatPreparationCountdown,
   isFoodOrder,
   preparationDueMs,
+  preparationLabel,
+  preparationSummary,
   showsPreparationTimer,
 } from '../services/prepTimer';
 
@@ -146,12 +148,14 @@ export function OrderCard({
 
   const showMakingTime = isFood && order.status === 'pending' && !!onAccept;
 
-  // ── Food preparation countdown — one element, reused by every card variant ──
+  // ── Food preparation — live while in Processing, frozen once it leaves ──
   const dueMs = preparationDueMs(order);
   const countdown =
     dueMs !== null && showsPreparationTimer(order)
       ? formatPreparationCountdown(dueMs, prepNow ?? Date.now())
       : null;
+  const summary = preparationSummary(order);
+  const prepLabel = summary ? preparationLabel(summary) : null;
   const prepTimerRow = countdown ? (
     <View
       testID="prep-timer"
@@ -166,6 +170,18 @@ export function OrderCard({
         <View style={styles.lateBadge}>
           <Text style={styles.lateBadgeText}>Late</Text>
         </View>
+      ) : null}
+    </View>
+  ) : prepLabel ? (
+    /* Both numbers come off the stored instants, so this row says the same
+       thing on every device and after any restart, and it cannot grow. The
+       lateness is what the vendor must notice, so it is the red part. */
+    <View testID="prep-summary" style={styles.prepRow}>
+      <Text style={styles.prepSummaryTime}>{prepLabel.prepared}</Text>
+      {prepLabel.late ? (
+        <Text style={[styles.prepSummaryTime, styles.prepTimeLate]}>
+          {prepLabel.late}
+        </Text>
       ) : null}
     </View>
   ) : null;
@@ -502,6 +518,8 @@ export function OrderCard({
           <Text style={styles.orderId}>#{order.orderNumber || order.id}</Text>
           <StatusBadge status={order.status} size="small" />
         </View>
+
+        {prepTimerRow}
 
         {/* ── Meta: Date · items · customer · phone ── */}
         <Text style={styles.meta}>
@@ -871,6 +889,16 @@ const styles = StyleSheet.create({
   },
   prepTime: {
     flex: 1,
+    fontSize: 15,
+    fontWeight: '700',
+    color: Colors.gray900,
+    fontVariant: ['tabular-nums'],
+  },
+  /* The frozen row has two parts side by side, so neither may claim the flex
+     the countdown timer needs — and both must shrink rather than run off the
+     card once the seconds are spelled out. */
+  prepSummaryTime: {
+    flexShrink: 1,
     fontSize: 15,
     fontWeight: '700',
     color: Colors.gray900,

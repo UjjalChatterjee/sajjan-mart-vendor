@@ -47,6 +47,7 @@ import {
   setBackgroundMessageHandler,
 } from '@react-native-firebase/messaging';
 import type { RemoteMessage } from '@react-native-firebase/messaging';
+import type { PreparationTimerPatch } from '../types';
 import { apiPost } from './api.client';
 import { syncApiBaseUrlToNative } from '../config/apiBaseUrl';
 import {
@@ -882,18 +883,27 @@ export async function settleNotificationAction(
     // that register these handlers. This is also what makes the headless
     // runtime work: no component, no App.tsx, no login screen required.
     const { acceptOrder, rejectOrder } = require('../services/order.service') as {
-      acceptOrder(id: string): Promise<unknown>;
+      acceptOrder(id: string): Promise<PreparationTimerPatch | null>;
       rejectOrder(id: string): Promise<unknown>;
     };
 
+    /* The accept reply carries the deadline the server just stamped. Handing it
+     * to applyOrderDecision puts it straight into the order cache, so the
+     * Processing card counts down from the real remaining time instead of from
+     * whenever the order list happens to be fetched again. */
+    let timer: PreparationTimerPatch | null = null;
     if (action === 'ORDER_ACCEPT') {
-      await acceptOrder(orderId);
+      timer = await acceptOrder(orderId);
     } else {
       await rejectOrder(orderId);
     }
 
     console.log(`[ORDER-ACTION] ${actionName} order ${orderId} confirmed by server`);
-    applyOrderDecision(orderId, action === 'ORDER_ACCEPT' ? 'ACCEPTED' : 'REJECTED');
+    applyOrderDecision(
+      orderId,
+      action === 'ORDER_ACCEPT' ? 'ACCEPTED' : 'REJECTED',
+      timer,
+    );
     return true;
   } catch (error) {
     const status = (error as { status?: number } | null)?.status;

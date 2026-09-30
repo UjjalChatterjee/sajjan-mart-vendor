@@ -16,10 +16,20 @@
  *   10 overtime keeps growing                        → 'countdown from the deadline'
  *   11 a completed order stops the timer             → 'terminal statuses'
  *   12 a concurrent accept cannot reset the deadline → 'deadline ownership'
+ *
+ *   Phase 6 — the countdown belongs to Processing only:
+ *   P1/P2 processing keeps counting (and goes red late)  → 'the frozen … duration'
+ *   P3-P5 leaving Processing freezes the actual duration → 'the frozen … duration'
+ *   P6/P7 restart and multi-device invariance            → 'the frozen … duration'
+ *   P8 an absent server timestamp invents nothing        → 'the frozen … duration'
+ *   P9 non-food orders unaffected                        → 'the frozen … duration'
+ *   P10 the accept race stays server-owned               → 'the frozen … duration'
  */
 
 import React from 'react';
+import { StyleSheet } from 'react-native';
 import { act, create } from 'react-test-renderer';
+import { Colors } from '../src/theme/colors';
 
 /* ── The popup plays a looping siren through the native bridge — out of scope
  *    for these tests, and it must not be touched by a render. */
@@ -61,12 +71,16 @@ import {
   PREP_MIN_MINUTES,
   clampPreparationMinutes,
   formatPreparationCountdown,
+  formatPreparationDuration,
   isFoodItem,
   isFoodOrder,
   preparationDueMs,
+  preparationLabel,
+  preparationSummary,
+  serverPreparationTimer,
   showsPreparationTimer,
 } from '../src/services/prepTimer';
-import type { Order, OrderItem } from '../src/types';
+import type { Order, OrderItem, PreparationTimerPatch } from '../src/types';
 
 /* ── Fixtures ────────────────────────────────────────────────────────── */
 
@@ -137,6 +151,7 @@ function rawOrder(overrides: Record<string, unknown> = {}) {
     payment_status: 'pending',
     address: { line1: 'Somewhere' },
     notes: null,
+    has_food: true,
     created_at: '2026-09-30T10:00:00.000Z',
     updated_at: '2026-09-30T10:05:00.000Z',
     user: { id: 'u1', name: 'Test Customer', phone: '9999999999' },
@@ -545,7 +560,7 @@ describe('terminal statuses stop the timer', () => {
     acceptedAt: '2026-09-30T10:00:00.000Z',
   };
 
-  it.each(['confirmed', 'processing', 'packed', 'shipped'] as const)(
+  it.each(['confirmed', 'processing', 'packed'] as const)(
     '%s is still owed kitchen time',
     status => {
       expect(showsPreparationTimer(foodOrder({ status: status as Order['status'], ...accepted }))).toBe(
@@ -554,7 +569,7 @@ describe('terminal statuses stop the timer', () => {
     },
   );
 
-  it.each(['delivered', 'cancelled', 'refunded'] as const)(
+  it.each(['shipped', 'delivered', 'cancelled', 'refunded'] as const)(
     '%s ends the countdown without ending the order automatically',
     status => {
       const order = foodOrder({
@@ -581,6 +596,7 @@ describe('terminal statuses stop the timer', () => {
      * and the card has nothing to count down from. */
     mockApiGet.mockResolvedValueOnce([
       rawOrder({
+        has_food: false,
         order_items: [
           {
             id: 'i2',
@@ -1105,5 +1121,587 @@ describe('the pending order card', () => {
     await press(card.tree, 'prep-minus');
     expect(stepperValue(popup)).toBe(minutes(29));
     expect(stepperValue(card.tree)).toBe(minutes(29));
+  });
+});
+
+/* ── The countdown lives only in Processing ─────────────────────────────
+ *
+ * Once the order leaves the kitchen the timer must stop and the row must
+ * report how long the food actually took. Both numbers come from instants the
+ * server stamped itself: the duration is `accepted_at` → `prepared_at` and the
+ * lateness is `preparation_due_at` → `prepared_at`. The selected making time is
+ * never either of them, and the device clock is never read, so a restart, a
+ * second phone, or a stale tab cannot restate it.
+ */
+
+const ACCEPT_AT = '2026-09-30T14:00:00.000Z';
+
+describe('the frozen preparation duration', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  /** The user's example: accepted 2:00 PM, ready 2:24 PM → 24 min. */
+  const READY_AT = '2026-09-30T14:24:00.000Z';
+  /** Selected 30, took 37 → `Prepared in 37 min · Late by 7 min`. */
+  const SLOW_READY_AT = '2026-09-30T14:37:00.000Z';
+  /** The deadline for a 30 minute selection, so lateness is real. */
+  const DUE_30 = '2026-09-30T14:30:00.000Z';
+
+  const live = (texts: string[]) =>
+    texts.filter(t => ['Ready in', 'Late by', 'Late'].includes(t));
+
+  /**
+   * The frozen row is two text nodes — the neutral duration and the red
+   * lateness — so the sentence is read back by joining the two.
+   */
+  const sentence = (texts: string[]) =>
+    texts
+      .filter(t => t.startsWith('Prepared in') || t.startsWith('· Late by'))
+      .join(' ');
+
+  const sentenceOf = (order: Order) => {
+    const label = preparationLabel(preparationSummary(order)!);
+    return [label.prepared, label.late].filter(Boolean).join(' ');
+  };
+
+  /** A finished food order: `selected` making time, ready `afterMinutes` later. */
+  function finished(
+    selected: number,
+    afterMinutes: number,
+    overrides: Partial<Order> = {},
+    afterSeconds = 0
+  ): Order {
+    const iso = (minutes: number, seconds = 0) =>
+      new Date(Date.parse(ACCEPT_AT) + minutes * 60_000 + seconds * 1000).toISOString();
+    return foodOrder({
+      status: 'shipped',
+      acceptedAt: iso(0),
+      preparationTimeMinutes: selected,
+      preparationDueAt: iso(selected),
+      preparedAt: iso(afterMinutes, afterSeconds),
+      ...overrides,
+    });
+  }
+
+  it('P1 — a Processing order still counts down, exactly as before', async () => {
+    const order = foodOrder({
+      status: 'confirmed',
+      acceptedAt: ACCEPT_AT,
+      preparationTimeMinutes: 25,
+      preparationDueAt: DUE,
+    });
+    expect(showsPreparationTimer(order)).toBe(true);
+
+    const card = await mountCard(order, DUE_MS - 600_000);
+    const texts = hostTexts(card);
+    expect(texts).toContain('Ready in');
+    expect(texts).toContain('10:00');
+    expect(texts).not.toContain('Prepared in 24 min');
+  });
+
+  it('P2 — a Processing order past its deadline shows the red Late by timer', async () => {
+    const order = foodOrder({
+      status: 'packed',
+      acceptedAt: ACCEPT_AT,
+      preparationTimeMinutes: 25,
+      preparationDueAt: DUE,
+    });
+
+    const card = await mountCard(order, DUE_MS + 120_000);
+    const texts = hostTexts(card);
+    expect(texts).toContain('Late by');
+    expect(texts).toContain('+02:00');
+    expect(texts).toContain('Late');
+  });
+
+  it('P3 — an order that left Processing stops counting and shows the actual time', async () => {
+    const order = foodOrder({
+      status: 'shipped',
+      acceptedAt: ACCEPT_AT,
+      preparedAt: READY_AT,
+      preparationTimeMinutes: 30,
+      preparationDueAt: DUE_30,
+    });
+
+    // The device clock is far past the deadline; a live countdown would say
+    // `Late by`. It does not — the row is frozen and on time.
+    const card = await mountCard(order, DUE_MS + 86_400_000);
+    const texts = hostTexts(card);
+    expect(live(texts)).toEqual([]);
+    expect(texts).toContain('Prepared in 24 min');
+    expect(preparationSummary(order)).toEqual({
+      actualSeconds: 1440,
+      lateSeconds: null,
+    });
+  });
+
+  it('P4 — going past the deadline is reported from the deadline, not the selection', () => {
+    const order = foodOrder({
+      status: 'delivered',
+      acceptedAt: ACCEPT_AT,
+      preparedAt: SLOW_READY_AT,
+      preparationTimeMinutes: 30,
+      preparationDueAt: DUE_30,
+    });
+
+    expect(sentenceOf(order)).toBe('Prepared in 37 min · Late by 7 min');
+    /* The lateness is its own node so it can be red while the duration is not. */
+    expect(preparationLabel(preparationSummary(order)!)).toEqual({
+      prepared: 'Prepared in 37 min',
+      late: '· Late by 7 min',
+    });
+  });
+
+  it('P4b — finishing early never claims lateness', () => {
+    const order = foodOrder({
+      status: 'delivered',
+      acceptedAt: ACCEPT_AT,
+      preparedAt: READY_AT,
+      preparationTimeMinutes: 30,
+      preparationDueAt: DUE_30,
+    });
+
+    expect(sentenceOf(order)).toBe('Prepared in 24 min');
+    expect(preparationLabel(preparationSummary(order)!).late).toBeNull();
+  });
+
+  it('P5 — a Dispatch-tab card never keeps counting, whatever the clock says', async () => {
+    const order = foodOrder({
+      status: 'shipped',
+      acceptedAt: ACCEPT_AT,
+      preparedAt: SLOW_READY_AT,
+      preparationTimeMinutes: 30,
+      preparationDueAt: DUE_30,
+    });
+
+    const first = hostTexts(await mountCard(order, DUE_MS + 60_000));
+    const second = hostTexts(await mountCard(order, DUE_MS + 9 * 3_600_000));
+
+    expect(live(first)).toEqual([]);
+    expect(live(second)).toEqual([]);
+    expect(sentence(first)).toBe('Prepared in 37 min · Late by 7 min');
+    expect(sentence(second)).toBe(sentence(first));
+  });
+
+  it('P6 — a restart re-reads the same frozen duration from the row', async () => {
+    const row = rawOrder({
+      status: 'shipped',
+      accepted_at: ACCEPT_AT,
+      prepared_at: SLOW_READY_AT,
+      preparation_time_minutes: 30,
+      preparation_due_at: DUE_30,
+    });
+
+    // Before the restart and after it: two separate fetches of the same row.
+    mockApiGet.mockResolvedValueOnce([row]);
+    const [before] = await getOrders();
+    mockApiGet.mockResolvedValueOnce([row]);
+    const [after] = await getOrders();
+
+    expect(before.preparedAt).toBe(SLOW_READY_AT);
+    expect(preparationSummary(after)).toEqual(preparationSummary(before));
+    expect(sentenceOf(after)).toBe('Prepared in 37 min · Late by 7 min');
+  });
+
+  it('P7 — two devices reading the same row print the same sentence', async () => {
+    const row = rawOrder({
+      status: 'delivered',
+      accepted_at: ACCEPT_AT,
+      prepared_at: READY_AT,
+      preparation_time_minutes: 30,
+    });
+    mockApiGet.mockResolvedValueOnce([row, row]);
+    const [phoneA, phoneB] = await getOrders();
+
+    const cardA = hostTexts(await mountCard(phoneA, DUE_MS));
+    const cardB = hostTexts(await mountCard(phoneB, DUE_MS + 720_000));
+
+    expect(sentence(cardA)).toBe('Prepared in 24 min');
+    expect(sentence(cardB)).toBe(sentence(cardA));
+  });
+
+  it('P8 — an order finished before prepared_at existed invents no duration', async () => {
+    const order = foodOrder({
+      status: 'shipped',
+      acceptedAt: ACCEPT_AT,
+      preparationTimeMinutes: 25,
+      preparationDueAt: DUE,
+    });
+
+    expect(preparationSummary(order)).toBeNull();
+    const texts = hostTexts(await mountCard(order, DUE_MS + 600_000));
+    expect(live(texts)).toEqual([]);
+    expect(texts.some(t => t.startsWith('Prepared in'))).toBe(false);
+  });
+
+  it('P8b — a contradictory pair of instants is not shown as a duration', () => {
+    expect(
+      preparationSummary(
+        foodOrder({
+          status: 'shipped',
+          acceptedAt: SLOW_READY_AT,
+          preparedAt: ACCEPT_AT,
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  it('P9 — a non-food order is untouched outside Processing', async () => {
+    const shipped: Order = { ...nonFoodOrder(), status: 'shipped' };
+
+    expect(preparationSummary(shipped)).toBeNull();
+    expect(showsPreparationTimer(shipped)).toBe(false);
+
+    const texts = hostTexts(await mountCard(shipped, DUE_MS));
+    expect(live(texts)).toEqual([]);
+    expect(texts.some(t => t.startsWith('Prepared in'))).toBe(false);
+  });
+
+  it('P10 — the client never sends a timestamp of its own', async () => {
+    await acceptOrder('order-1', 35);
+
+    const body = mockApiPut.mock.calls[0][1] as Record<string, unknown>;
+    // Race protection depends on this: only the winning accept claim on the
+    // server may stamp accepted_at / preparation_due_at / prepared_at.
+    expect(Object.keys(body).sort()).toEqual([
+      'preparation_time_minutes',
+      'status',
+    ]);
+  });
+
+  it('P10b — losing the accept race leaves no local timer behind', async () => {
+    mockApiPut.mockRejectedValueOnce({
+      status: 409,
+      error: 'ORDER_ALREADY_PROCESSED',
+    });
+
+    await expect(acceptOrder('order-1', 20)).rejects.toMatchObject({ status: 409 });
+    // Nothing was stamped on this device, so a pending order stays a pending
+    // order: no countdown, no frozen duration.
+    const order = foodOrder();
+    expect(showsPreparationTimer(order)).toBe(false);
+    expect(preparationSummary(order)).toBeNull();
+  });
+
+  /* ── The reported field bug: a late 1 minute order read "Prepared in 1 min" ── */
+
+  it('F1 — a 1 minute target finished after 5 minutes is late by 4', async () => {
+    const order = finished(1, 5);
+    const texts = hostTexts(await mountCard(order, Date.parse(SLOW_READY_AT)));
+
+    expect(preparationSummary(order)).toEqual({ actualSeconds: 300, lateSeconds: 240 });
+    expect(sentence(texts)).toBe('Prepared in 5 min · Late by 4 min');
+  });
+
+  /** The real production row behind the Phase 8 report: 80.56 s of preparation
+   *  against a 1 minute deadline. Whole-minute rounding made that read either
+   *  "Prepared in 1 min" with nothing late, or "2 min · Late by 1 min". */
+  it('F2 — the reported row prints its seconds, not rounded minutes', async () => {
+    const order = foodOrder({
+      status: 'shipped',
+      acceptedAt: '2026-09-30T10:09:16.551Z',
+      preparationTimeMinutes: 1,
+      preparationDueAt: '2026-09-30T10:10:16.551Z',
+      preparedAt: '2026-09-30T10:10:37.111Z',
+    });
+    const texts = hostTexts(await mountCard(order, DUE_MS));
+
+    expect(preparationSummary(order)).toEqual({ actualSeconds: 80, lateSeconds: 20 });
+    expect(sentence(texts)).toBe('Prepared in 1 min 20 sec · Late by 20 sec');
+    // Neither of the two answers whole-minute maths could give.
+    expect(texts).not.toContain('Prepared in 1 min');
+    expect(texts).not.toContain('· Late by 1 min');
+  });
+
+  it('F3 — the selected making time is never used as the duration', () => {
+    // Asked for 30, done in 5: the row must say 5, and must not be late.
+    expect(preparationSummary(finished(30, 5))).toEqual({
+      actualSeconds: 300,
+      lateSeconds: null,
+    });
+    // Asked for 1, done in 37: the selection cannot make it 1.
+    expect(sentenceOf(finished(1, 37))).toBe('Prepared in 37 min · Late by 36 min');
+  });
+
+  it('F4 — only the deadline can make an order late', () => {
+    // No stored deadline: a long preparation past the selection is still not
+    // described as late, because nothing was ever due.
+    expect(
+      preparationSummary(finished(20, 30, { preparationDueAt: undefined }))
+    ).toEqual({ actualSeconds: 1800, lateSeconds: null });
+    // Exactly at the deadline is on time.
+    expect(preparationSummary(finished(30, 30))).toEqual({
+      actualSeconds: 1800,
+      lateSeconds: null,
+    });
+  });
+
+  it('F5 — a part-minute is printed as seconds, never rounded up to a minute', () => {
+    const order = finished(1, 1, {}, 20); // 1 min 20 s of a 1 min target
+    expect(order.preparedAt).toBe('2026-09-30T14:01:20.000Z');
+    expect(preparationSummary(order)).toEqual({ actualSeconds: 80, lateSeconds: 20 });
+    expect(sentenceOf(order)).toBe('Prepared in 1 min 20 sec · Late by 20 sec');
+  });
+
+  it('F6 — the server numbers survive the mapping and win over local maths', async () => {
+    /* A row that carries the computed durations, alongside timestamps that
+     * would derive something else. The card prints what the backend decided,
+     * which is what makes every device agree. */
+    mockApiGet.mockResolvedValueOnce([
+      rawOrder({
+        status: 'shipped',
+        accepted_at: ACCEPT_AT,
+        prepared_at: READY_AT,
+        preparation_due_at: DUE_30,
+        preparation: { actual_seconds: 380, late_seconds: 305 },
+      }),
+    ]);
+    const [order] = await getOrders();
+
+    expect(order.preparation).toEqual({ actualSeconds: 380, lateSeconds: 305 });
+    expect(preparationSummary(order)).toEqual({ actualSeconds: 380, lateSeconds: 305 });
+    const texts = hostTexts(await mountCard(order, Date.now()));
+    expect(sentence(texts)).toBe('Prepared in 6 min 20 sec · Late by 5 min 5 sec');
+  });
+
+  it('F7 — moving from Dispatch to Completed cannot restate the duration', async () => {
+    const order = finished(1, 5);
+    const dispatch = hostTexts(
+      await mountCard(order, Date.parse('2026-09-30T18:00:00.000Z'))
+    );
+    const completed = hostTexts(
+      await mountCard(
+        { ...order, status: 'delivered' },
+        Date.parse('2026-10-01T09:00:00.000Z')
+      )
+    );
+
+    expect(sentence(dispatch)).toBe('Prepared in 5 min · Late by 4 min');
+    expect(sentence(completed)).toBe(sentence(dispatch));
+  });
+
+  it('F8 — a non-food order still shows no duration', () => {
+    const done = { ...nonFoodOrder(), status: 'delivered' as Order['status'] };
+    expect(preparationSummary(done)).toBeNull();
+  });
+});
+
+/* ── Phase 9 ─────────────────────────────────────────────────────────────
+ *
+ * Two field reports about the same card:
+ *   BUG 1 — a Making Time of 1 opened in Processing at `00:42`.
+ *   BUG 2 — 5 seconds of lateness printed as `Late by 1 min`.
+ *
+ * BUG 1 was not the deadline being wrong (the server stores `accepted_at` plus
+ * exactly 60 000 ms — measured on the live API). It was the device throwing
+ * away the accept response, which already carried that deadline, and learning
+ * the timer only from the next order-list fetch. By then the kitchen had
+ * genuinely been working for those seconds. The countdown is correct to show
+ * them; it must not have to wait for a fetch to find them out.
+ *
+ * BUG 2 was units: both numbers were rounded to whole minutes.
+ */
+describe('Phase 9 — the server deadline arrives with the accept', () => {
+  const T = Date.parse(ACCEPT_AT);
+  const iso = (ms: number) => new Date(ms).toISOString();
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  /** The reply to a successful accept of a `minutes` minute food order. */
+  function acceptReply(minutes: number, over: Record<string, unknown> = {}) {
+    return rawOrder({
+      status: 'confirmed',
+      accepted_at: iso(T),
+      preparation_time_minutes: minutes,
+      preparation_due_at: iso(T + minutes * 60_000),
+      ...over,
+    });
+  }
+
+  /** The row the cache holds once that reply has been applied. */
+  const patched = (
+    patch: PreparationTimerPatch,
+    status: Order['status'] = 'confirmed',
+  ) => ({
+    ...foodOrder({ status }),
+    ...patch,
+  });
+
+  it('T1 — a 1 minute order is due exactly 60 000 ms after accepted_at', () => {
+    const patch = serverPreparationTimer('order-1', acceptReply(1))!;
+    expect(Date.parse(patch.preparationDueAt!) - Date.parse(patch.acceptedAt!)).toBe(60_000);
+    expect(patch.preparationTimeMinutes).toBe(1);
+  });
+
+  it('T2 — at the server acceptance instant the whole minute is still ahead', () => {
+    expect(formatPreparationCountdown(T + 60_000, T)).toEqual({
+      label: '01:00',
+      late: false,
+    });
+  });
+
+  it('T3 — 18 s of real kitchen work leaves 42 s, and the deadline itself never moves', async () => {
+    const row = patched(serverPreparationTimer('order-1', acceptReply(1))!);
+
+    expect(formatPreparationCountdown(preparationDueMs(row)!, T + 18_000).label).toBe('00:42');
+
+    /* The deadline is the server's, not something a render or a clock tick
+     * re-arms: two renders at different instants read the same stored instant. */
+    const stored = preparationDueMs(row);
+    await mountCard(row, T + 18_000);
+    await mountCard(row, T + 55_000);
+    expect(preparationDueMs(row)).toBe(stored);
+    expect(stored).toBe(T + 60_000);
+  });
+
+  it('T4 — the accept response starts the countdown, with no list fetch in between', async () => {
+    mockApiPut.mockResolvedValueOnce(acceptReply(1));
+    const patch = await acceptOrder('order-1', 1);
+
+    expect(patch).toEqual({
+      acceptedAt: iso(T),
+      preparationDueAt: iso(T + 60_000),
+      preparationTimeMinutes: 1,
+    });
+
+    const row = patched(patch!);
+    expect(showsPreparationTimer(row)).toBe(true);
+    const texts = hostTexts(await mountCard(row, T + 18_000));
+    expect(texts).toContain('Ready in');
+    expect(texts).toContain('00:42');
+  });
+
+  it('T5 — nothing is invented when the reply has no readable deadline', async () => {
+    expect(serverPreparationTimer('order-1', acceptReply(1, { id: 'order-2' }))).toBeNull();
+    expect(serverPreparationTimer('order-1', acceptReply(1, { preparation_due_at: null }))).toBeNull();
+    expect(serverPreparationTimer('order-1', acceptReply(1, { preparation_due_at: 'soon' }))).toBeNull();
+    expect(serverPreparationTimer('order-1', undefined)).toBeNull();
+
+    // A non-food accept: the server stores no timer, so this device shows none.
+    mockApiPut.mockResolvedValueOnce(
+      acceptReply(1, { preparation_due_at: null, accepted_at: null, preparation_time_minutes: null })
+    );
+    const patch = await acceptOrder('order-1', 1);
+    expect(patch).toBeNull();
+    expect(showsPreparationTimer(patched(patch ?? {}))).toBe(false);
+  });
+
+  it('T6 — an old cached row cannot delay the countdown a new device sees', () => {
+    /* Before the fix the timer came from whatever the last list fetch returned,
+     * so a row still marked pending offered no deadline at all. The accept
+     * reply alone is enough now. */
+    const stale = foodOrder({ status: 'pending' });
+    expect(showsPreparationTimer(stale)).toBe(false);
+
+    const fresh = patched(serverPreparationTimer('order-1', acceptReply(1))!);
+    expect(fresh.status).toBe('confirmed');
+    expect(showsPreparationTimer(fresh)).toBe(true);
+  });
+});
+
+describe('Phase 9 — lateness and duration keep their seconds', () => {
+  const T = Date.parse(ACCEPT_AT);
+  const iso = (ms: number) => new Date(ms).toISOString();
+
+  /** A 1 minute food order the kitchen finished `lateBy` seconds past the deadline. */
+  function ready(lateBy: number, status: Order['status'] = 'shipped'): Order {
+    return foodOrder({
+      status,
+      acceptedAt: iso(T),
+      preparationTimeMinutes: 1,
+      preparationDueAt: iso(T + 60_000),
+      preparedAt: iso(T + 60_000 + lateBy * 1000),
+    });
+  }
+
+  const sentenceOf = (order: Order) => {
+    const label = preparationLabel(preparationSummary(order)!);
+    return [label.prepared, label.late].filter(Boolean).join(' ');
+  };
+
+  /** The colour the card actually renders `text` with. */
+  const colorOf = (tree: ReturnType<typeof create>, text: string) => {
+    const [node] = tree.root.findAll(
+      n => typeof n.type === 'string' && n.children.flat().map(String).join('') === text,
+    );
+    return (StyleSheet.flatten(node?.props.style) as { color?: string } | undefined)?.color;
+  };
+
+  it('T7 — exact seconds are printed as seconds, never rounded up to a minute', () => {
+    expect(formatPreparationDuration(5)).toBe('5 sec');
+    expect(formatPreparationDuration(45)).toBe('45 sec');
+    expect(formatPreparationDuration(59)).toBe('59 sec');
+    expect(formatPreparationDuration(60)).toBe('1 min');
+    expect(formatPreparationDuration(65)).toBe('1 min 5 sec');
+    expect(formatPreparationDuration(125)).toBe('2 min 5 sec');
+  });
+
+  it('T8 — the late caption reads 5 sec, 59 sec, 1 min, 1 min 5 sec, 2 min 5 sec', () => {
+    expect(sentenceOf(ready(5))).toBe('Prepared in 1 min 5 sec · Late by 5 sec');
+    expect(sentenceOf(ready(59))).toBe('Prepared in 1 min 59 sec · Late by 59 sec');
+    expect(sentenceOf(ready(60))).toBe('Prepared in 2 min · Late by 1 min');
+    expect(sentenceOf(ready(65))).toBe('Prepared in 2 min 5 sec · Late by 1 min 5 sec');
+    expect(sentenceOf(ready(125))).toBe('Prepared in 3 min 5 sec · Late by 2 min 5 sec');
+  });
+
+  it('T9 — a 45 second kitchen is reported in seconds and is not late', () => {
+    const early = foodOrder({
+      status: 'shipped',
+      acceptedAt: iso(T),
+      preparationTimeMinutes: 1,
+      preparationDueAt: iso(T + 60_000),
+      preparedAt: iso(T + 45_000),
+    });
+
+    expect(preparationSummary(early)).toEqual({ actualSeconds: 45, lateSeconds: null });
+    expect(sentenceOf(early)).toBe('Prepared in 45 sec');
+  });
+
+  it('T10 — Dispatch shows the same frozen seconds the kitchen ended with', async () => {
+    const order = ready(5);
+    const card = await mountCard(order, T + 9 * 3_600_000);
+    const texts = hostTexts(card);
+
+    expect(texts.filter(t => ['Ready in', 'Late by', 'Late'].includes(t))).toEqual([]);
+    expect(texts).toContain('Prepared in 1 min 5 sec');
+    expect(texts).toContain('· Late by 5 sec');
+
+    /* The lateness is the thing the vendor must notice, so it is the red part;
+     * the duration itself stays neutral. And it cannot grow: the same row hours
+     * later says the same. */
+    expect(colorOf(card, '· Late by 5 sec')).toBe(Colors.danger);
+    expect(colorOf(card, 'Prepared in 1 min 5 sec')).not.toBe(Colors.danger);
+    expect(hostTexts(await mountCard(order, T + 48 * 3_600_000))).toEqual(texts);
+  });
+
+  it('T11 — a restart and a second phone print the same seconds', async () => {
+    const row = rawOrder({
+      status: 'shipped',
+      accepted_at: iso(T),
+      preparation_due_at: iso(T + 60_000),
+      prepared_at: iso(T + 65_000),
+      preparation_time_minutes: 1,
+    });
+
+    mockApiGet.mockResolvedValueOnce([row]);
+    const [phoneA] = await getOrders();
+    mockApiGet.mockResolvedValueOnce([row]);
+    const [phoneB] = await getOrders();
+
+    expect(preparationSummary(phoneA)).toEqual({ actualSeconds: 65, lateSeconds: 5 });
+    expect(hostTexts(await mountCard(phoneA, T + 65_000))).toEqual(
+      hostTexts(await mountCard(phoneB, T + 4_000_000)),
+    );
+  });
+
+  it('T12 — the seconds the server computed win, and the selector never becomes a duration', () => {
+    // A 1 minute selection that took 4 minutes: 240 s, late by 180 s.
+    const order = ready(180);
+    expect(order.preparationTimeMinutes).toBe(1);
+    expect(preparationSummary(order)).toEqual({ actualSeconds: 240, lateSeconds: 180 });
+    expect(sentenceOf(order)).toBe('Prepared in 4 min · Late by 3 min');
   });
 });

@@ -16,7 +16,7 @@ import React, {
   useMemo,
   ReactNode,
 } from 'react';
-import type { Order } from '../types';
+import type { Order, PreparationTimerPatch } from '../types';
 import * as orderService from '../services/order.service';
 
 /* ── State shape ── */
@@ -31,7 +31,10 @@ interface OrderStoreState {
 
 interface OrderStoreActions {
   loadOrders: () => Promise<void>;
-  acceptOrder: (id: string, preparationMinutes?: number) => Promise<void>;
+  acceptOrder: (
+    id: string,
+    preparationMinutes?: number,
+  ) => Promise<PreparationTimerPatch | null>;
   rejectOrder: (id: string) => Promise<void>;
   addIncomingOrder: (order: Order) => void;
 }
@@ -67,9 +70,8 @@ export function OrderStoreProvider({ children }: { children: ReactNode }) {
 
   /* ── Accept ── */
   const accept = useCallback(
-    async (id: string, preparationMinutes?: number) => {
-      await orderService.acceptOrder(id, preparationMinutes);
-    },
+    async (id: string, preparationMinutes?: number) =>
+      orderService.acceptOrder(id, preparationMinutes),
     [],
   );
 

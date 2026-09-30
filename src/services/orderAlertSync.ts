@@ -34,7 +34,7 @@ import {
   startOrderVibration,
   stopOrderVibration,
 } from './orderVibration';
-import type { Order, OrderStatus } from '../types';
+import type { Order, OrderStatus, PreparationTimerPatch } from '../types';
 
 /* ── Types ── */
 
@@ -205,16 +205,26 @@ function cancelOrderNotification(orderId: string): void {
 }
 
 /**
- * Move the cached order row to its decided status without waiting for a refetch
- * (when the status is known), then invalidate so the list reconciles with the
- * backend.
+ * Move the cached order row to its decided status — and to the preparation
+ * timer the server just stamped — without waiting for a refetch, then invalidate
+ * so the list reconciles with the backend.
+ *
+ * `timer` only ever carries values read off this order's own server response
+ * (see `serverPreparationTimer`); a device never authors a deadline. Patching it
+ * is what stops the Processing card from counting down from a stale list row.
  */
-function patchOrdersCache(orderId: string, status: OrderStatus | null): void {
-  if (status) {
+function patchOrdersCache(
+  orderId: string,
+  status: OrderStatus | null,
+  timer?: PreparationTimerPatch | null,
+): void {
+  if (status || timer) {
     queryClient.setQueryData<Order[]>(ORDER_QUERY_KEY, prev =>
       prev
         ? prev.map(order =>
-            order.id === orderId ? { ...order, status } : order,
+            order.id === orderId
+              ? { ...order, ...(status ? { status } : null), ...(timer ?? null) }
+              : order,
           )
         : prev,
     );
@@ -231,10 +241,15 @@ function patchOrdersCache(orderId: string, status: OrderStatus | null): void {
  *
  * Idempotent: repeat calls stop at the same end state (sound off, modal closed,
  * notification cancelled, order recorded as decided).
+ *
+ * `timer` belongs to this device's own successful ACCEPT only: it is the
+ * deadline the server returned with that reply, so the Processing card can
+ * count down from it immediately. Push-driven and reconciliation calls omit it.
  */
 export function applyOrderDecision(
   orderId: string | undefined | null,
   rawStatus?: string | OrderStatus | null,
+  timer?: PreparationTimerPatch | null,
 ): void {
   if (!orderId) return;
 
@@ -274,7 +289,7 @@ export function applyOrderDecision(
   }
 
   cancelOrderNotification(orderId);
-  patchOrdersCache(orderId, status);
+  patchOrdersCache(orderId, status, timer);
 
   listeners.forEach(listener => {
     try {

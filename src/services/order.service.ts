@@ -6,7 +6,17 @@
  */
 
 import { apiGet, apiPost, apiPut } from './api.client';
-import type { Order, OrderAddress, OrderAmounts, BackendOrder, OrderItem, BackendOrderItem } from '../types';
+import { serverPreparationTimer } from './prepTimer';
+import type {
+  Order,
+  OrderAddress,
+  OrderAmounts,
+  BackendOrder,
+  OrderItem,
+  BackendOrderItem,
+  PreparationSummary,
+  PreparationTimerPatch,
+} from '../types';
 
 /** Cancel approve / reject response shape from the backend. */
 export interface CancelActionResponse {
@@ -95,6 +105,20 @@ function mapBackendOrder(raw: BackendOrder): Order {
       }
     : undefined;
 
+  /* The backend's own frozen preparation numbers, kept as they arrive so no
+     device re-measures the kitchen against a local clock. */
+  const rawPreparation = raw.preparation as Record<string, unknown> | null | undefined;
+  const preparation: PreparationSummary | undefined =
+    rawPreparation && typeof rawPreparation.actual_seconds === 'number'
+      ? {
+          actualSeconds: rawPreparation.actual_seconds,
+          lateSeconds:
+            typeof rawPreparation.late_seconds === 'number'
+              ? rawPreparation.late_seconds
+              : null,
+        }
+      : undefined;
+
   return {
     id: raw.id,
     orderNumber: raw.order_number,
@@ -123,6 +147,8 @@ function mapBackendOrder(raw: BackendOrder): Order {
         : undefined,
     acceptedAt: raw.accepted_at ?? undefined,
     preparationDueAt: raw.preparation_due_at ?? undefined,
+    preparedAt: raw.prepared_at ?? undefined,
+    preparation,
   };
 }
 
@@ -153,17 +179,22 @@ export async function getOrders(): Promise<Order[]> {
  * non-food orders and derives `accepted_at` / `preparation_due_at` itself, so
  * the deadline this device shows is the one it stored. Omit it (the card and
  * notification paths) and the server uses its default.
+ *
+ * Resolves with the timer from that response so the caller can put the
+ * authoritative deadline into the order cache straight away. Returning nothing
+ * for a non-food order or an unreadable reply is correct — no timer is invented.
  */
 export async function acceptOrder(
   orderId: string,
   preparationTimeMinutes?: number,
-): Promise<void> {
-  await apiPut(`/api/orders/${encodeURIComponent(orderId)}`, {
+): Promise<PreparationTimerPatch | null> {
+  const raw = await apiPut<BackendOrder>(`/api/orders/${encodeURIComponent(orderId)}`, {
     status: 'confirmed',
     ...(preparationTimeMinutes === undefined
       ? {}
       : { preparation_time_minutes: preparationTimeMinutes }),
   });
+  return serverPreparationTimer(orderId, raw);
 }
 
 /**
